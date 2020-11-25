@@ -1,6 +1,6 @@
 # Neural Radiance Fields (NeRF) with Flax
 
-This repository is an unofficial reimplementation of *NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis*, using [Flax](https://github.com/google/flax) and the [Linen API](https://github.com/google/flax/tree/master/flax/linen).
+This repository is an unofficial implementation of *NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis*, using [Flax](https://github.com/google/flax) and the [Linen API](https://github.com/google/flax/tree/master/flax/linen).
 
 B. Mildenhall, P.P. Srinivasan, M. Tancik, J.T. Barron, R. Ramamoorthi and R. Ng, *NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis*, 2020, ECCV, [arXiv:2003.08934 [cs.CV]](https://arxiv.org/abs/2003.08934).
 
@@ -16,18 +16,18 @@ Most of the comments are from the original work, which are very helpful for unde
 
 ## Installation
 
-Install [JAX](https://github.com/google/jax#installation) according to your platform configuration. Then, install the necessary dependencies with:
+Install `jax` and `jaxlib` according to your [platform configuration](https://github.com/google/jax#installation). Then, install the necessary dependencies with:
 
 ```
-pip install -r requirements.txt
+pip install imageio flax pandas tensorboard tensorflow ml_collections
 ```
 
 ## Data
 
 There are three subsets of data used in the original publication that can be downloaded from [nerf_data](https://drive.google.com/drive/folders/128yBriW1IG_3NJ5Rp7APSTZsJqdJdfc1):
-- Deep Voxels (Vincent Sitzmann [GDrive](https://drive.google.com/open?id=1lUvJWB6oFtT8EQ_NzBrXnmi25BufxRfl))
-- LLFF (NeRF authors [GDrive](https://drive.google.com/drive/folders/14boI-o5hGO9srnWaaogTU5_ji7wkX2S7))
-- Blender aka nerf_synthetic (NeRF authors [GDrive](https://drive.google.com/drive/folders/1JDdLGDruGNXWnM1eqY1FNL9PlStjaKWi))
+- [Deep Voxels](https://drive.google.com/open?id=1lUvJWB6oFtT8EQ_NzBrXnmi25BufxRfl) (Vincent Sitzmann)
+- [LLFF](https://drive.google.com/drive/folders/14boI-o5hGO9srnWaaogTU5_ji7wkX2S7) (NeRF authors)
+- [Blender](https://drive.google.com/drive/folders/1JDdLGDruGNXWnM1eqY1FNL9PlStjaKWi) aka nerf_synthetic (NeRF authors)
 
 In addition, there is:
 - [nerf_example_data](https://people.eecs.berkeley.edu/~bmild/nerf/nerf_example_data.zip), which contains simply the `lego` (from Blender) and `fern` (from LLFF) scenes
