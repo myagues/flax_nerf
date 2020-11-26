@@ -1,5 +1,7 @@
+import functools
+
 from flax import linen as nn
-from jax import numpy as jnp, vmap
+from jax import numpy as jnp, lax, vmap
 from typing import Any, Callable, Sequence
 
 
@@ -17,6 +19,7 @@ class NeRF(nn.Module):
     input_channels: int = 3
     output_channels: int = 4
     dtype: Any = jnp.float32
+    precision: Any = lax.Precision.DEFAULT
 
     def embed(self, inputs, multires):
         inputs = jnp.reshape(inputs, [-1, self.input_channels])
@@ -47,9 +50,10 @@ class NeRF(nn.Module):
         if self.use_embed:
             inputs_pts = self.embed(inputs_pts, self.multires)
 
+        dense = functools.partial(nn.Dense, dtype=self.dtype, precision=self.precision)
         x = inputs_pts
         for i in range(self.net_depth):
-            x = nn.Dense(self.net_width, dtype=self.dtype)(x)
+            x = dense(self.net_width)(x)
             x = nn.relu(x)
             if i in self.skips:
                 x = jnp.concatenate([x, inputs_pts], axis=-1)
@@ -61,8 +65,8 @@ class NeRF(nn.Module):
             if self.use_embed:
                 inputs_views = self.embed(inputs_views, self.multires_views)
 
-            alpha_out = nn.Dense(1, dtype=self.dtype)(x)
-            bottleneck = nn.Dense(256, dtype=self.dtype)(x)
+            alpha_out = dense(1)(x)
+            bottleneck = dense(256)(x)
             inputs_viewdirs = jnp.concatenate([bottleneck, inputs_views], axis=-1)
 
             # "the supplement to the paper states there are 4 hidden layers here,
@@ -70,10 +74,10 @@ class NeRF(nn.Module):
             # 1 hidden layer, so we will leave it as 1."
             x = inputs_viewdirs
             for i in range(1):
-                x = nn.Dense(self.net_width // 2, dtype=self.dtype)(x)
+                x = dense(self.net_width // 2)(x)
                 x = nn.relu(x)
-            x = nn.Dense(3, dtype=self.dtype)(x)
+            x = dense(3)(x)
             x = jnp.concatenate([x, alpha_out], axis=-1)
         else:
-            x = nn.Dense(self.output_channels, dtype=self.dtype)(x)
+            x = dense(self.output_channels)(x)
         return x
