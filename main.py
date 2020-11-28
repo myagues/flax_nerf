@@ -18,7 +18,7 @@ from typing import Any, Optional
 from datasets import load_blender, load_deepvoxels
 from model import NeRF
 from rays_utils import prepare_rays
-from utils import create_learning_rate_scheduler, eval_step, psnr_fn, train_step
+from utils import create_learning_rate_scheduler, eval_step, train_step
 
 jax_config.enable_omnistaging()
 
@@ -42,10 +42,10 @@ flags.DEFINE_string(
 
 def gen_video(data, filename, hwf, step, ch=3):
     img_h, img_w, _ = hwf
-    data = 255 * jnp.clip(data.reshape([-1, img_h, img_w, ch]), 0, 1)
+    data = 255 * np.clip(data.reshape([-1, img_h, img_w, ch]), 0, 1)
     imageio.mimwrite(
         os.path.join(FLAGS.model_dir, f"{filename}_{step:06d}.mp4"),
-        data.astype(jnp.uint8),
+        data.astype(np.uint8),
         fps=30,
         quality=8,
     )
@@ -53,12 +53,12 @@ def gen_video(data, filename, hwf, step, ch=3):
 
 def save_test_imgs(data, hwf, step, ch=3):
     img_h, img_w, _ = hwf
-    data = 255 * jnp.clip(data.reshape([-1, img_h, img_w, ch]), 0, 1)
+    data = 255 * np.clip(data.reshape([-1, img_h, img_w, ch]), 0, 1)
     save_path = os.path.join(FLAGS.model_dir, f"testset_{step:06d}")
     os.makedirs(save_path, exist_ok=True)
     [
         imageio.imwrite(os.path.join(save_path, f"{idx:02d}.png"), x)
-        for idx, x in enumerate(data.astype(jnp.uint8))
+        for idx, x in enumerate(data.astype(np.uint8))
     ]
 
 
@@ -152,7 +152,8 @@ def main(_):
     else:
         r_hwf = hwf
 
-    reshape_fn = lambda x, h=img_h, w=img_w, ch=3: jnp.reshape(x, [h, w, ch])
+    to_np = lambda x, h=img_h, w=img_w: np.reshape(x, [h, w, -1]).astype(np.float32)
+    psnr_fn = lambda x: -10.0 * np.log(x) / np.log(10.0)
 
     ### Pre-compute rays
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -176,9 +177,10 @@ def main(_):
         train_rays = jnp.reshape(train_rays, [-1, train_rays.shape[-1]])
         train_imgs = jnp.reshape(train_imgs, [-1, 3])
         logging.info("Batched rays shape: %s", train_rays.shape)
+        val_rays = lax.map(lambda pose: prep_rays(hwf, pose), val_poses)
 
-    val_rays = lax.map(lambda pose: prep_rays(hwf, pose), val_poses)
     test_rays = lax.map(lambda pose: prep_rays(r_hwf, pose), test_poses)
+    test_rays = jnp.reshape(test_rays, render_shape)
 
     ### Init model parameters and optimizer
     input_pts_shape = (FLAGS.config.num_rand, FLAGS.config.num_samples, 3)
@@ -300,28 +302,30 @@ def main(_):
             ### Eval a random validation image and plot it in TB
             if step % FLAGS.config.i_img == 0:
                 val_idx = random.randint(test_rng, [1], minval=0, maxval=counts[1])
-                inputs = val_rays[val_idx, ...].reshape(render_shape)
-                target = val_imgs[val_idx, ...]
+                if FLAGS.config.batching:
+                    inputs = val_rays[tuple(val_idx)].reshape(render_shape)
+                else:
+                    inputs = prep_rays(hwf, val_poses[tuple(val_idx)])
+                    inputs = jnp.reshape(inputs, render_shape)
+                target = val_imgs[tuple(val_idx)]
                 preds, preds_c, z_std = lax.map(lambda x: p_eval_step(state, x), inputs)
-                rgb = reshape_fn(preds["rgb"])
-                loss = jnp.mean((rgb - target) ** 2)
+                rgb = to_np(preds["rgb"])
+                loss = np.mean((rgb - target) ** 2)
 
                 summary_writer.scalar(f"val/loss", loss, step)
                 summary_writer.scalar(f"val/psnr", psnr_fn(loss), step)
 
-                rgb = 255 * jnp.clip(rgb, 0, 1)
-                summary_writer.image("val/rgb", rgb.astype(jnp.uint8), step)
-                summary_writer.image("val/target", target[0], step)
-                summary_writer.image("val/disp", reshape_fn(preds["disp"], ch=1), step)
-                summary_writer.image("val/acc", reshape_fn(preds["acc"], ch=1), step)
+                rgb = 255 * np.clip(rgb, 0, 1)
+                summary_writer.image("val/rgb", rgb.astype(np.uint8), step)
+                summary_writer.image("val/target", target, step)
+                summary_writer.image("val/disp", to_np(preds["disp"]), step)
+                summary_writer.image("val/acc", to_np(preds["acc"]), step)
 
                 if FLAGS.config.num_importance > 0:
-                    rgb = 255 * jnp.clip(reshape_fn(preds_c["rgb"]), 0, 1)
-                    summary_writer.image("val/rgb_c", rgb.astype(jnp.uint8), step)
-                    summary_writer.image(
-                        "val/disp_c", reshape_fn(preds_c["disp"], ch=1), step
-                    )
-                    summary_writer.image("val/z_std", reshape_fn(z_std, ch=1), step)
+                    rgb = 255 * np.clip(to_np(preds_c["rgb"]), 0, 1)
+                    summary_writer.image("val/rgb_c", rgb.astype(np.uint8), step)
+                    summary_writer.image("val/disp_c", to_np(preds_c["disp"]), step)
+                    summary_writer.image("val/z_std", to_np(z_std), step)
 
         ### Render a video with test poses
         if step % FLAGS.config.i_video == 0 and step > 0:
@@ -339,16 +343,12 @@ def main(_):
         ### Save images in the test set
         if step % FLAGS.config.i_testset == 0 and step > 0:
             logging.info("Rendering test set at step %d", step)
-            preds, *_ = lax.map(
-                lambda x: p_eval_step(state, x),
-                test_rays.reshape(render_shape),
-            )
-            save_test_imgs(preds["rgb"], r_hwf, step)
+            preds, *_ = lax.map(lambda x: p_eval_step(state, x), test_rays)
+            rgb = np.array(preds["rgb"], dtype=np.float32)
+            save_test_imgs(rgb, r_hwf, step)
 
             if FLAGS.config.render_factor == 0:
-                loss = jnp.mean(
-                    (preds["rgb"].reshape(test_imgs.shape) - test_imgs) ** 2.0
-                )
+                loss = np.mean((rgb.reshape(test_imgs.shape) - test_imgs) ** 2.0)
                 summary_writer.scalar(f"test/loss", loss, step)
                 summary_writer.scalar(f"test/psnr", psnr_fn(loss), step)
 

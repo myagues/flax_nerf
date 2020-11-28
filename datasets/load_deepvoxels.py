@@ -1,14 +1,11 @@
 import functools
 import glob
-import imageio
-import json
 import os
 
-import jax
+import imageio
 
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 
 from absl import logging
 
@@ -63,8 +60,8 @@ def parse_intrinsics(dataset_dir, target_side_len, invert_y=False):
         "cx: %f, cy: %f, f: %f, height: %f, width: %f", cx, cy, f, height, width
     )
 
-    cx = cx / width * target_side_len
-    cy = cy / height * target_side_len
+    cx /= width * target_side_len
+    cy /= height * target_side_len
     fx = target_side_len / height * f
     fy = -f if invert_y else f
 
@@ -99,10 +96,11 @@ def load_dv_data(dataset_dir, scene="cube", testskip=8):
     val_poses = dir2poses(dataset_subdir("validation"), testskip=testskip)
     test_poses = dir2poses(dataset_subdir("test"), testskip=testskip)
     all_poses = np.concatenate([train_poses, val_poses, test_poses])
+    del train_poses, val_poses
 
     train_imgs = get_imgs(dataset_subdir("train"))
-    test_imgs = get_imgs(dataset_subdir("test"), testskip=testskip)
     val_imgs = get_imgs(dataset_subdir("validation"), testskip=testskip)
+    test_imgs = get_imgs(dataset_subdir("test"), testskip=testskip)
 
     all_imgs = np.concatenate([train_imgs, val_imgs, test_imgs])
     counts = [train_imgs.shape[0], val_imgs.shape[0], test_imgs.shape[0]]
