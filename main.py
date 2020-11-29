@@ -336,19 +336,20 @@ def main(_):
             gen_video(preds["disp"] / jnp.max(preds["disp"]), "disp", r_hwf, step, ch=1)
 
             if FLAGS.config.use_viewdirs:
-                preds, *_ = lax.map(lambda x: p_eval_step(state, x), rays_render_vdirs)
-                gen_video(preds["rgb"], "rgb_still", r_hwf, step)
+                preds = lax.map(
+                    lambda x: p_eval_step(state, x)[0]["rgb"], rays_render_vdirs
+                )
+                gen_video(preds, "rgb_still", r_hwf, step)
             logging.info("Video rendering done in %ds", time.time() - t)
 
         ### Save images in the test set
         if step % FLAGS.config.i_testset == 0 and step > 0:
             logging.info("Rendering test set at step %d", step)
-            preds, *_ = lax.map(lambda x: p_eval_step(state, x), test_rays)
-            rgb = np.array(preds["rgb"], dtype=np.float32)
-            save_test_imgs(rgb, r_hwf, step)
+            preds = lax.map(lambda x: p_eval_step(state, x)[0]["rgb"], test_rays)
+            save_test_imgs(preds, r_hwf, step)
 
             if FLAGS.config.render_factor == 0:
-                loss = np.mean((rgb.reshape(test_imgs.shape) - test_imgs) ** 2.0)
+                loss = np.mean((preds.reshape(test_imgs.shape) - test_imgs) ** 2.0)
                 summary_writer.scalar(f"test/loss", loss, step)
                 summary_writer.scalar(f"test/psnr", psnr_fn(loss), step)
 

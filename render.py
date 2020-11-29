@@ -32,15 +32,14 @@ config_flags.DEFINE_config_file(
 flags.DEFINE_integer("seed", default=0, help=("Initialization seed."))
 flags.DEFINE_string("data_dir", default=None, help=("Directory containing data files."))
 flags.DEFINE_string("model_dir", default=None, help=("Directory to store model data."))
-flags.DEFINE_string("video_dir", default=None, help=("Directory to save video render."))
+flags.DEFINE_string("save_dir", default=None, help=("Directory to store outputs."))
+flags.DEFINE_string(
+    "render_video_set",
+    default="render",
+    help=("Subset of data to use to render the video."),
+)
 flags.DEFINE_bool("render_video", default=True, help=("Whether to render video."))
 flags.DEFINE_bool("render_testset", default=True, help=("Whether to render testset."))
-
-flags.DEFINE_string(
-    "render_set",
-    default="render_poses",
-    help=("Which set of images will be used for rendering."),
-)
 flags.DEFINE_string(
     "jax_backend_target",
     default=None,
@@ -51,22 +50,31 @@ flags.DEFINE_string(
 def gen_video(data, filename, hwf, step, ch=3):
     img_h, img_w, _ = hwf
     data = 255 * jnp.clip(data.reshape([-1, img_h, img_w, ch]), 0, 1)
-    if FLAGS.video_dir is None:
-        video_path = FLAGS.model_dir
+    if FLAGS.save_dir is None:
+        out_path = FLAGS.model_dir
     else:
-        video_path = FLAGS.video_dir
+        out_path = FLAGS.save_dir
     imageio.mimwrite(
-        os.path.join(video_path, f"{filename}_{step:06d}.mp4"),
+        os.path.join(out_path, f"{filename}_{step:06d}.mp4"),
         data.astype(jnp.uint8),
         fps=30,
         quality=8,
+    )
+    imageio.mimwrite(
+        os.path.join(out_path, f"{filename}_{step:06d}.gif"),
+        data.astype(jnp.uint8),
+        fps=30,
     )
 
 
 def save_test_imgs(data, hwf, step, ch=3):
     img_h, img_w, _ = hwf
     data = 255 * jnp.clip(data.reshape([-1, img_h, img_w, ch]), 0, 1)
-    save_path = os.path.join(FLAGS.model_dir, f"testset_{step:06d}")
+    if FLAGS.save_dir is None:
+        out_path = FLAGS.model_dir
+    else:
+        out_path = FLAGS.save_dir
+    save_path = os.path.join(out_path, f"testset_{step:06d}")
     os.makedirs(save_path, exist_ok=True)
     [
         imageio.imwrite(os.path.join(save_path, f"{idx:02d}.png"), x)
@@ -167,17 +175,13 @@ def main(_):
             c2w_sc = c2w_sc[:3, :4]
         return prepare_rays(None, hwf, FLAGS.config, near, far, c2w[:3, :4], c2w_sc)
 
-    rays_render = lax.map(lambda x: prep_rays(r_hwf, x), render_poses)
-    render_shape = [-1, n_devices, r_hwf[1], rays_render.shape[-1]]
-    rays_render = jnp.reshape(rays_render, render_shape)
-    logging.info("Render rays shape: %s", rays_render.shape)
-
-    if FLAGS.config.use_viewdirs:
-        rays_render_vdirs = lax.map(
-            lambda x: prep_rays(r_hwf, x, render_poses[0]), render_poses
-        ).reshape(render_shape)
-
-    test_rays = lax.map(lambda pose: prep_rays(r_hwf, pose), test_poses)
+    render_dict = {
+        "train": train_poses,
+        "val": val_poses,
+        "test": test_poses,
+        "render": render_poses,
+    }
+    render_poses = render_dict[FLAGS.render_video_set]
 
     ### Init model parameters and optimizer
     input_pts_shape = (FLAGS.config.num_rand, FLAGS.config.num_samples, 3)
@@ -205,37 +209,54 @@ def main(_):
         model_fn = (model_coarse.apply, model_fine.apply)
 
     state = checkpoints.restore_checkpoint(FLAGS.model_dir, state)
+    state_step = int(state.step)
     state = jax_utils.replicate(state)
 
     p_eval_step = jax.pmap(
         functools.partial(eval_step, model_fn, FLAGS.config),
         axis_name="batch",
     )
+    eval_fn = lambda x: p_eval_step(state, x)[0]["rgb"]
 
     if FLAGS.render_video:
-        logging.info("Rendering video at step %d", int(state.step))
+        rays_render = lax.map(lambda x: prep_rays(r_hwf, x), render_poses)
+        render_shape = [-1, n_devices, r_hwf[1], rays_render.shape[-1]]
+        rays_render = jnp.reshape(rays_render, render_shape)
+        logging.info("Render rays shape: %s", rays_render.shape)
+
+        logging.info("Rendering video at step %d", state_step)
         t = time.time()
         preds, *_ = lax.map(lambda x: p_eval_step(state, x), rays_render)
-        gen_video(preds["rgb"], "rgb", r_hwf, int(state.step))
+        gen_video(preds["rgb"], "rgb", r_hwf, state_step)
         gen_video(
-            preds["disp"] / jnp.max(preds["disp"]), "disp", r_hwf, int(state.step), ch=1
+            preds["disp"] / jnp.max(preds["disp"]), "disp", r_hwf, state_step, ch=1
         )
+        if FLAGS.render_video_set == "test" and FLAGS.config.render_factor == 0:
+            loss = jnp.mean((preds["rgb"].reshape(test_imgs.shape) - test_imgs) ** 2.0)
+            logging.info("test/loss %.5f", loss)
+            logging.info("test/psnr %.5f", psnr_fn(loss))
 
-        if FLAGS.config.use_viewdirs and FLAGS.render_subset == "render_poses":
-            preds, *_ = lax.map(lambda x: p_eval_step(state, x), rays_render_vdirs)
-            gen_video(preds["rgb"], "rgb_still", r_hwf, int(state.step))
+        if FLAGS.config.use_viewdirs:
+            logging.info("Rendering video for view directions at step %d", state_step)
+            rays_render_vdirs = lax.map(
+                lambda x: prep_rays(r_hwf, x, render_poses[0]), render_poses
+            ).reshape(render_shape)
+            preds = lax.map(eval_fn, rays_render_vdirs)
+            gen_video(preds, "rgb_still", r_hwf, state_step)
         logging.info("Video rendering done in %ds", time.time() - t)
 
     if FLAGS.render_testset:
-        logging.info("Rendering test set at step %d", int(state.step))
-        preds, *_ = lax.map(
-            lambda x: p_eval_step(state, x),
-            test_rays.reshape(render_shape),
+        test_rays = lax.map(lambda pose: prep_rays(r_hwf, pose), test_poses)
+        test_rays = jnp.reshape(
+            test_rays, [-1, n_devices, r_hwf[1], test_rays.shape[-1]]
         )
-        save_test_imgs(preds["rgb"], r_hwf, int(state.step))
+        logging.info("Test rays shape: %s", test_rays.shape)
+        logging.info("Rendering test set at step %d", state_step)
+        preds = lax.map(eval_fn, test_rays)
+        save_test_imgs(preds, r_hwf, state_step)
 
         if FLAGS.config.render_factor == 0:
-            loss = jnp.mean((preds["rgb"].reshape(test_imgs.shape) - test_imgs) ** 2.0)
+            loss = jnp.mean((preds.reshape(test_imgs.shape) - test_imgs) ** 2.0)
             logging.info("test/loss %.5f", loss)
             logging.info("test/psnr %.5f", psnr_fn(loss))
 
