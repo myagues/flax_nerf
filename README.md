@@ -25,13 +25,13 @@ pip install imageio imageio-ffmpeg flax pandas tensorboard tensorflow ml_collect
 ## Data
 
 There are three subsets of data used in the original publication that can be downloaded from [nerf_data](https://drive.google.com/drive/folders/128yBriW1IG_3NJ5Rp7APSTZsJqdJdfc1):
+- [Blender](https://drive.google.com/drive/folders/1JDdLGDruGNXWnM1eqY1FNL9PlStjaKWi) aka nerf_synthetic (NeRF authors)
 - [DeepVoxels](https://drive.google.com/open?id=1lUvJWB6oFtT8EQ_NzBrXnmi25BufxRfl) (Vincent Sitzmann)
 - [LLFF](https://drive.google.com/drive/folders/14boI-o5hGO9srnWaaogTU5_ji7wkX2S7) (NeRF authors)
-- [Blender](https://drive.google.com/drive/folders/1JDdLGDruGNXWnM1eqY1FNL9PlStjaKWi) aka nerf_synthetic (NeRF authors)
 
 In addition, there is:
-- [nerf_example_data](https://people.eecs.berkeley.edu/~bmild/nerf/nerf_example_data.zip), which contains simply the `lego` (from Blender) and `fern` (from LLFF) scenes
-- [tiny_nerf_data](https://people.eecs.berkeley.edu/~bmild/nerf/tiny_nerf_data.npz) used in the simplified notebook example is a low resolution `lego`
+- [nerf_example_data](https://people.eecs.berkeley.edu/~bmild/nerf/nerf_example_data.zip) is limited to the `lego` (from Blender) and `fern` (from LLFF) scenes
+- [tiny_nerf_data](https://people.eecs.berkeley.edu/~bmild/nerf/tiny_nerf_data.npz) is a low resolution `lego` used in the simplified notebook example
 
 ## How to run
 
@@ -42,40 +42,48 @@ Required parameters to run the training are:
 
 ```
 python main.py \
-    --data_dir=/data/nerf/nerf_synthetic/lego \
-    --model_dir=./logs \
-    --config=./configs/test_blender_lego.py
+    --data_dir=/data/nerf_synthetic/lego \
+    --model_dir=logs \
+    --config=configs/test_blender_lego.py
 ```
 
 Configuration flag is defined using [`config_flags`](https://github.com/google/ml_collections/tree/master#config-flags), which allows overriding configuration fields, and can be done as follows:
 
 ```
 python main.py \
-    --data_dir=/data/nerf/nerf_synthetic/lego \
-    --model_dir=./logs \
-    --config=./configs/test_blender_lego.py \
+    --data_dir=/data/nerf_synthetic/lego \
+    --model_dir=logs \
+    --config=configs/test_blender_lego.py \
     --config.num_samples=128 \
     --config.i_print=250
 ```
 
 ## Examples
 
-All these examples were run on an NVIDIA RTX 2080 Ti:
+All these examples were run on an NVIDIA RTX 2080 Ti with commit [e81d608](https://github.com/myagues/flax_nerf/tree/e81d608128d92c8d15fd17c21834a5e47c185359):
 
 - `lego` scene from the Blender dataset with `--config.num_importance={0,64}`:
 
 ```
 python main.py \
-    --data_dir=/data/nerf_synthetic_lego \
-    --model_dir=./logs_lego_64 \
-    --config=./configs/test_blender_lego.py
+    --data_dir=/data/nerf_synthetic/lego \
+    --model_dir=logs_lego_64 \
+    --config=configs/test_blender_lego.py
+
+python render.py \
+    --data_dir=/data/nerf_synthetic/lego \
+    --model_dir=logs_lego_64 \
+    --config=configs/test_blender_lego.py \
+    --config.render_factor=0 \
+    --config.testskip=0 \
+    --render_video_set=test
 ```
 
 ```
 python main.py \
     --data_dir=/data/nerf_synthetic_lego \
-    --model_dir=./logs_lego_0 \
-    --config=./configs/test_blender_lego.py \
+    --model_dir=logs_lego_0 \
+    --config=configs/test_blender_lego.py \
     --config.num_importance=0
 
 python render.py \
@@ -90,16 +98,16 @@ python render.py \
 
 Checkpoint path | Test set PSNR | Test set loss | TensorBoard.dev
 :---------------: | :-------------: | :-------------: |---------------:
-[lego_ckpt_0](https://drive.google.com/drive/folders/1h0r4ePMLueGExAqWJvWKUJORf9ju3XCF?usp=sharing) | 26.544 | 0.00222 | [2020-11-30](https://tensorboard.dev/experiment/WsKI4cYQS8OKDCMPFGPOLA)
-[lego_ckpt_64](https://drive.google.com/drive/folders/1gM3eVfYQgYLsCqUDHxv0I0N3BfgAHlWE?usp=sharing) | 31.779 | 0.00066 | [2020-11-30](https://tensorboard.dev/experiment/WsKI4cYQS8OKDCMPFGPOLA)
+[lego_ckpt_0](https://drive.google.com/drive/folders/1h0r4ePMLueGExAqWJvWKUJORf9ju3XCF?usp=sharing) | 26.544 | 2.2e-3 | [2020-11-30](https://tensorboard.dev/experiment/WsKI4cYQS8OKDCMPFGPOLA)
+[lego_ckpt_64](https://drive.google.com/drive/folders/1gM3eVfYQgYLsCqUDHxv0I0N3BfgAHlWE?usp=sharing) | 31.779 | 6.6e-4 | [2020-11-30](https://tensorboard.dev/experiment/WsKI4cYQS8OKDCMPFGPOLA)
 
 - `vase` scene from the DeepVoxels dataset:
 
 ```
 python main.py \
     --data_dir=/data/deepvoxels \
-    --model_dir=./logs_dv_vase \
-    --config=./configs/test_dvox_greek.py \
+    --model_dir=logs_dv_vase \
+    --config=configs/test_dvox_greek.py \
     --config.shape=vase \
     --config.num_importance=128 \
     --config.precrop_iters=500 \
@@ -116,15 +124,15 @@ python render.py \
     --config.shape=vase \
     --config.num_importance=128 \
     --config.render_factor=0 \
-    --config.testskip=8 \
+    --config.testskip=4 \
     --render_video=False
 ```
 
 Checkpoint path | Test set PSNR* | Test set loss* | TensorBoard.dev
 :---------------: | :-------------: | :-------------: |---------------:
-[vase_ckpt](https://drive.google.com/drive/folders/1yFquenIxwG2BfMrHOgiYZ_T9bSG8iUIN?usp=sharing) | 35.324 | 0.00029 | [2020-11-30](https://tensorboard.dev/experiment/HJN9sZNPQ9mknFNuVHkKkA)
+[vase_ckpt](https://drive.google.com/drive/folders/1yFquenIxwG2BfMrHOgiYZ_T9bSG8iUIN?usp=sharing) | 35.328 | 2.9e-4 | [2020-11-30](https://tensorboard.dev/experiment/HJN9sZNPQ9mknFNuVHkKkA)
 
-*Only a subset of the test set has been, given that DeepVoxels has a big amount of images
+*Only a subset of the test set has been used, given that DeepVoxels has a big amount of images
 
 ## Tips and caveats
 
@@ -152,5 +160,6 @@ XLA_FLAGS="--xla_force_host_platform_device_count=4 xla_cpu_multi_thread_eigen=F
 ## TODO
 
 - Add LLFF data reader
-- Rendering routines use `lax.map`, which is problematic if image size is not divisible by the number of devices. Try using `lax.fori_loop` with slices and mask padding for a more flexible implementation.
-- Add some trained checkpoints
+- Rendering routines use `lax.map`, which is problematic if image size is not divisible by the number of devices. Try using mask and padding for a more flexible implementation.
+- Redo DeepVoxels data reader with `tf.data.Dataset`
+- Most of the processes are done with batches of rays, rewrite everything for a single ray and `vmap/pmap/xmap` as needed (wait for JAX unified map API [JAX#2939](https://github.com/google/jax/issues/2939))
