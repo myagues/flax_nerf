@@ -29,7 +29,8 @@ def dir2poses(dataset_dir, testskip=None):
     poses = poses @ transf
     poses = poses[:, :3, :4].astype(np.float32)
     if testskip is not None:
-        return poses[::testskip]
+        skip = 1 if testskip == 0 else testskip
+        return poses[::skip]
     return poses
 
 
@@ -37,7 +38,8 @@ def get_imgs(dataset_dir, testskip=None):
     img_list = sorted(glob.glob(os.path.join(dataset_dir, "rgb", "*.png")))
     imgs = np.stack([imageio.imread(f) / 255.0 for f in img_list]).astype(np.float32)
     if testskip is not None:
-        return imgs[::testskip]
+        skip = 1 if testskip == 0 else testskip
+        return imgs[::skip]
     return imgs
 
 
