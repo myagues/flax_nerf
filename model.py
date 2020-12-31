@@ -22,7 +22,6 @@ class NeRF(nn.Module):
     precision: Any = lax.Precision.DEFAULT
 
     def embed(self, inputs, multires):
-        inputs = jnp.reshape(inputs, [-1, self.input_channels])
         features_chn, _ = inputs.shape
 
         max_freq_log2 = multires - 1
@@ -46,6 +45,7 @@ class NeRF(nn.Module):
     def __call__(self, inputs_pts, inputs_views):
         assert inputs_pts.shape[2] == self.input_channels
         inputs_pts_shape = inputs_pts.shape
+        inputs_pts = jnp.reshape(inputs_pts, [-1, self.input_channels])
 
         if self.use_embed:
             inputs_pts = self.embed(inputs_pts, self.multires)
@@ -61,6 +61,7 @@ class NeRF(nn.Module):
         if self.use_viewdirs:
             assert inputs_views.shape[1] == self.input_channels
             inputs_views = jnp.broadcast_to(inputs_views[:, None], inputs_pts_shape)
+            inputs_views = jnp.reshape(inputs_views, [-1, self.input_channels])
 
             if self.use_embed:
                 inputs_views = self.embed(inputs_views, self.multires_views)

@@ -18,16 +18,12 @@ def get_rays(img_h, img_w, focal, c2w):
         rays: (2, img_h * img_w, 3) stacked origin and direction rays
     """
     i, j = jnp.meshgrid(jnp.arange(img_w), jnp.arange(img_h), indexing="xy")
-    dirs = jnp.stack(
-        [
-            (i - img_w * 0.5) / focal,
-            -(j - img_h * 0.5) / focal,
-            -jnp.ones_like(i),
-        ],
-        axis=-1,
-    )
-    rays_d = jnp.einsum("ijl,kl", dirs, c2w[:3, :3])
-    rays_o = jnp.broadcast_to(c2w[:3, -1], rays_d.shape)
+
+    dirs = [(i - img_w * 0.5) / focal, -(j - img_h * 0.5) / focal, -jnp.ones_like(i)]
+    dirs = jnp.stack(dirs, axis=-1)
+
+    rays_d = jnp.einsum("ijl,kl", dirs, c2w[:, :3])
+    rays_o = jnp.broadcast_to(c2w[:, -1], rays_d.shape)
     return jnp.stack([rays_o, rays_d])
 
 
