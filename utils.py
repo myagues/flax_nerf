@@ -122,9 +122,8 @@ def train_step(
         )
         coarse_res, weights = raw2outputs_(raw_c, z_vals, rays[1], rng=rng_2)
         loss_c = jnp.mean((coarse_res["rgb"] - target) ** 2.0)
-        coarse_res["raw"] = raw_c.astype(jnp.float32)
-        coarse_res["loss"] = loss_c
 
+        loss_f = 0
         if config.num_importance > 0:
             pts, z_vals, _ = render_rays_fine(
                 rays[:2], z_vals, weights, config.num_importance, config.perturb, rng_3
@@ -134,16 +133,9 @@ def train_step(
             )
             fine_res, _ = raw2outputs_(raw_f, z_vals, rays[1], rng=rng_4)
             loss_f = jnp.mean((fine_res["rgb"] - target) ** 2.0)
-            fine_res["raw"] = raw_f.astype(jnp.float32)
-            fine_res["loss"] = loss_f
-            psnr = psnr_fn(loss_f)
-        else:
-            psnr = psnr_fn(loss_c)
-            loss_f = 0
-            fine_res = None
 
         loss = loss_c + loss_f
-        return loss, (psnr, coarse_res, fine_res)
+        return loss, (loss_c, loss_f)
 
     lr = lr_fn(state.step)
     if config.num_importance > 0:
@@ -165,19 +157,18 @@ def train_step(
         optimizer_coarse=new_opt_coarse,
         optimizer_fine=new_opt_fine,
     )
-    loss, (psnr, coarse_res, fine_res) = aux
+    loss, (loss_c, loss_f) = aux
     metrics = {
         "loss": loss,
-        "loss_c": coarse_res["loss"],
-        "psnr": psnr,
-        "psnr_c": psnr_fn(coarse_res["loss"]),
+        "loss_c": loss_c,
+        "psnr": psnr_fn(loss_f) if config.num_importance > 0 else psnr_fn(loss_c),
+        "psnr_c": psnr_fn(loss_c),
         "lr": lr,
     }
     if config.num_importance > 0:
-        metrics["loss_f"] = fine_res["loss"]
-        metrics["psnr_f"] = psnr_fn(fine_res["loss"])
+        metrics.update({"loss_f": loss_f, "psnr_f": psnr_fn(loss_f)})
     metrics = lax.pmean(metrics, axis_name="batch")
-    return new_state, metrics, coarse_res, fine_res
+    return new_state, metrics
 
 
 def eval_step(model_fn, config, state, rays):

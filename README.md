@@ -19,7 +19,7 @@ Most of the comments are from the original work, which are very helpful for unde
 Install `jax` and `jaxlib` according to your [platform configuration](https://github.com/google/jax#installation). Then, install the necessary dependencies with:
 
 ```
-pip install imageio imageio-ffmpeg flax pandas tensorboard tensorflow ml_collections
+pip install clu imageio imageio-ffmpeg flax ml_collections pandas tensorboard tensorflow
 ```
 
 ## Data

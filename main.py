@@ -7,8 +7,8 @@ import jax
 import numpy as np
 
 from absl import app, flags, logging
+from clu import metric_writers, periodic_actions, platform
 from flax import jax_utils, optim, struct
-from flax.metrics import tensorboard
 from flax.training import checkpoints, common_utils
 from jax import numpy as jnp, lax, random
 from jax.config import config as jax_config
@@ -39,10 +39,13 @@ flags.DEFINE_string(
     help=("JAX backend target to use. Can be used with UPTC."),
 )
 
+to_rgb = lambda x: (255 * np.clip(np.asarray(x), 0, 1)).astype(np.uint8)
+psnr_fn = lambda x: -10.0 * np.log(x) / np.log(10.0)
+
 
 def gen_video(data, filename, hwf, step, ch=3):
     img_h, img_w, _ = hwf
-    data = 255 * np.clip(data.reshape([-1, img_h, img_w, ch]), 0, 1)
+    data = to_rgb(data.reshape([-1, img_h, img_w, ch]))
     imageio.mimwrite(
         os.path.join(FLAGS.model_dir, f"{filename}_{step:06d}.mp4"),
         data.astype(np.uint8),
@@ -53,7 +56,7 @@ def gen_video(data, filename, hwf, step, ch=3):
 
 def save_test_imgs(data, hwf, step, ch=3):
     img_h, img_w, _ = hwf
-    data = 255 * np.clip(data.reshape([-1, img_h, img_w, ch]), 0, 1)
+    data = to_rgb(data.reshape([-1, img_h, img_w, ch]))
     save_path = os.path.join(FLAGS.model_dir, f"testset_{step:06d}")
     os.makedirs(save_path, exist_ok=True)
     [
@@ -93,10 +96,14 @@ def main(_):
     logging.info("JAX host: %d / %d", jax.host_id(), jax.host_count())
     logging.info("JAX local devices: %r", jax.local_devices())
 
-    if jax.host_id() == 0:
-        summary_writer = tensorboard.SummaryWriter(FLAGS.model_dir)
-        # summary_writer.hparams(dict(FLAGS.config))
+    platform.work_unit().set_task_status(
+        f"host_id: {jax.host_id()}, host_count: {jax.host_count()}"
+    )
+    platform.work_unit().create_artifact(
+        platform.ArtifactType.DIRECTORY, FLAGS.model_dir, "workdir"
+    )
 
+    os.makedirs(FLAGS.model_dir, exist_ok=True)
     rng = random.PRNGKey(FLAGS.seed)
     rng, init_rng_coarse, init_rng_fine = random.split(rng, 3)
     n_devices = jax.device_count()
@@ -152,8 +159,11 @@ def main(_):
     else:
         r_hwf = hwf
 
-    to_np = lambda x, h=img_h, w=img_w: np.reshape(x, [h, w, -1]).astype(np.float32)
-    psnr_fn = lambda x: -10.0 * np.log(x) / np.log(10.0)
+    to_np = (
+        lambda x, h=img_h, w=img_w: np.asarray(x)
+        .reshape(1, h, w, -1)
+        .astype(np.float32)
+    )
 
     ### Pre-compute rays
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -227,142 +237,146 @@ def main(_):
             (hwf, near, far),
         ),
         axis_name="batch",
-        donate_argnums=(0,),
     )
     p_eval_step = jax.pmap(
         functools.partial(eval_step, model_fn, FLAGS.config),
         axis_name="batch",
     )
 
-    t = time.time()
+    writer = metric_writers.create_default_writer(
+        FLAGS.model_dir, just_logging=jax.host_id() > 0
+    )
+    logging.info("Starting training loop.")
+
+    hooks = []
+    profiler = periodic_actions.Profile(num_profile_steps=5, logdir=FLAGS.model_dir)
+    report_progress = periodic_actions.ReportProgress(
+        num_train_steps=FLAGS.config.num_steps, writer=writer
+    )
+    if jax.host_id() == 0:
+        hooks += [profiler, report_progress]
     train_metrics = []
 
-    for step in range(start_step, FLAGS.config.num_steps + 1):
-        rng, sample_rng, step_rng, test_rng = random.split(rng, 4)
-        sharded_rngs = common_utils.shard_prng_key(step_rng)
-        coords = None
+    with metric_writers.ensure_flushes(writer):
+        for step in range(start_step, FLAGS.config.num_steps + 1):
+            is_last_step = step == FLAGS.config.num_steps
 
-        if FLAGS.config.batching:
-            select_idx = random.randint(
-                sample_rng,
-                [n_devices * FLAGS.config.num_rand],
-                minval=0,
-                maxval=train_rays.shape[0],
-            )
-            inputs = train_rays[select_idx, ...]
-            inputs = jnp.reshape(inputs, [n_devices, FLAGS.config.num_rand, -1])
-            target = train_imgs[select_idx, ...]
-            target = jnp.reshape(target, [n_devices, FLAGS.config.num_rand, 3])
-        else:
-            img_idx = random.randint(
-                sample_rng, [n_devices], minval=0, maxval=counts[0]
-            )
-            inputs = train_poses[img_idx, ...]  # [n_devices, 4, 4]
-            target = train_imgs[img_idx, ...]  # [n_devices, img_h, img_w, 3]
+            rng, sample_rng, step_rng, test_rng = random.split(rng, 4)
+            sharded_rngs = common_utils.shard_prng_key(step_rng)
+            coords = None
 
-            if step < FLAGS.config.precrop_iters:
-                dH = int(img_h // 2 * FLAGS.config.precrop_frac)
-                dW = int(img_w // 2 * FLAGS.config.precrop_frac)
-                coords = jnp.meshgrid(
-                    jnp.arange(img_h // 2 - dH, img_h // 2 + dH),
-                    jnp.arange(img_w // 2 - dW, img_w // 2 + dW),
-                    indexing="ij",
+            if FLAGS.config.batching:
+                select_idx = random.randint(
+                    sample_rng,
+                    [n_devices * FLAGS.config.num_rand],
+                    minval=0,
+                    maxval=train_rays.shape[0],
                 )
-                coords = jax_utils.replicate(
-                    jnp.stack(coords, axis=-1).reshape([-1, 2])
+                inputs = train_rays[select_idx, ...]
+                inputs = jnp.reshape(inputs, [n_devices, FLAGS.config.num_rand, -1])
+                target = train_imgs[select_idx, ...]
+                target = jnp.reshape(target, [n_devices, FLAGS.config.num_rand, 3])
+            else:
+                img_idx = random.randint(
+                    sample_rng, [n_devices], minval=0, maxval=counts[0]
                 )
+                inputs = train_poses[img_idx, ...]  # [n_devices, 4, 4]
+                target = train_imgs[img_idx, ...]  # [n_devices, img_h, img_w, 3]
 
-        state, metrics, coarse_res, fine_res = p_train_step(
-            state, (inputs, target), coords, rng=sharded_rngs
-        )
-        train_metrics.append(metrics)
+                if step < FLAGS.config.precrop_iters:
+                    dH = int(img_h // 2 * FLAGS.config.precrop_frac)
+                    dW = int(img_w // 2 * FLAGS.config.precrop_frac)
+                    coords = jnp.meshgrid(
+                        jnp.arange(img_h // 2 - dH, img_h // 2 + dH),
+                        jnp.arange(img_w // 2 - dW, img_w // 2 + dW),
+                        indexing="ij",
+                    )
+                    coords = jax_utils.replicate(
+                        jnp.stack(coords, axis=-1).reshape([-1, 2])
+                    )
 
-        ### Write summaries to TB
-        if step % FLAGS.config.i_print == 0 and step > 0:
-            steps_per_sec = time.time() - t
-            train_metrics = common_utils.get_metrics(train_metrics)
-            train_summary = jax.tree_map(lambda x: x.mean(), train_metrics)
-            if jax.host_id() == 0:
-                logging.info(
-                    "Step: %6d, %.3f s/step, loss %.5f, psnr %6.3f",
-                    step,
-                    steps_per_sec,
-                    train_summary["loss"],
-                    train_summary["psnr"],
+            with jax.profiler.StepTraceContext("train", step_num=step):
+                state, metrics = p_train_step(
+                    state, (inputs, target), coords, rng=sharded_rngs
                 )
-                for key, val in train_summary.items():
-                    summary_writer.scalar(f"train/{key}", val, step)
+                train_metrics.append(metrics)
 
-                summary_writer.scalar("steps per second", steps_per_sec, step)
-                summary_writer.histogram("raw_c", np.array(coarse_res["raw"]), step)
-                if FLAGS.config.num_importance > 0:
-                    summary_writer.histogram("raw_f", np.array(fine_res["raw"]), step)
-            train_metrics = []
+            logging.log_first_n(logging.INFO, "Finished training step %d.", 5, step)
+            _ = [h(step) for h in hooks]
 
-            ### Eval a random validation image and plot it in TB
-            if step % FLAGS.config.i_img == 0:
-                val_idx = random.randint(test_rng, [1], minval=0, maxval=counts[1])
-                if FLAGS.config.batching:
-                    inputs = val_rays[tuple(val_idx)].reshape(render_shape)
-                else:
-                    inputs = prep_rays(hwf, val_poses[tuple(val_idx)])
-                    inputs = jnp.reshape(inputs, render_shape)
-                target = val_imgs[tuple(val_idx)]
-                preds, preds_c, z_std = lax.map(lambda x: p_eval_step(state, x), inputs)
-                rgb = to_np(preds["rgb"])
-                loss = np.mean((rgb - target) ** 2)
+            ### Write train summaries to TB
+            if step % FLAGS.config.i_print == 0 or is_last_step:
+                with report_progress.timed("training_metrics"):
+                    train_metrics = common_utils.get_metrics(train_metrics)
+                    train_summary = jax.tree_map(lambda x: x.mean(), train_metrics)
+                    summary = {f"train/{k}": v for k, v in train_summary.items()}
+                    writer.write_scalars(step, summary)
+                train_metrics = []
 
-                summary_writer.scalar(f"val/loss", loss, step)
-                summary_writer.scalar(f"val/psnr", psnr_fn(loss), step)
+            ### Eval a random validation image and plot it to TB
+            if step % FLAGS.config.i_img == 0 and step > 0 or is_last_step:
+                with report_progress.timed("validation"):
+                    val_idx = random.randint(test_rng, [1], minval=0, maxval=counts[1])
+                    if FLAGS.config.batching:
+                        inputs = val_rays[tuple(val_idx)].reshape(render_shape)
+                    else:
+                        inputs = prep_rays(hwf, val_poses[tuple(val_idx)])
+                        inputs = jnp.reshape(inputs, render_shape)
+                    target = val_imgs[tuple(val_idx)]
+                    outputs = lax.map(lambda x: p_eval_step(state, x), inputs)
+                    preds, preds_c, z_std = jax.tree_map(to_np, outputs)
+                    loss = np.mean((preds["rgb"] - target) ** 2)
+                    summary = {"val/loss": loss, "val/psnr": psnr_fn(loss)}
+                    writer.write_scalars(step, summary)
 
-                rgb = 255 * np.clip(rgb, 0, 1)
-                summary_writer.image("val/rgb", rgb.astype(np.uint8), step)
-                summary_writer.image("val/target", target, step)
-                summary_writer.image("val/disp", to_np(preds["disp"]), step)
-                summary_writer.image("val/acc", to_np(preds["acc"]), step)
+                    summary = {
+                        "val/rgb": to_rgb(preds["rgb"]),
+                        "val/target": to_np(target),
+                        "val/disp": preds["disp"],
+                        "val/acc": preds["acc"],
+                    }
+                    if FLAGS.config.num_importance > 0:
+                        summary["val/rgb_c"] = to_rgb(preds_c["rgb"])
+                        summary["val/disp_c"] = preds_c["disp"]
+                        summary["val/z_std"] = z_std
+                    writer.write_images(step, summary)
 
-                if FLAGS.config.num_importance > 0:
-                    rgb = 255 * np.clip(to_np(preds_c["rgb"]), 0, 1)
-                    summary_writer.image("val/rgb_c", rgb.astype(np.uint8), step)
-                    summary_writer.image("val/disp_c", to_np(preds_c["disp"]), step)
-                    summary_writer.image("val/z_std", to_np(z_std), step)
+            ### Render a video with test poses
+            if step % FLAGS.config.i_video == 0 and step > 0 or is_last_step:
+                with report_progress.timed("video_render"):
+                    logging.info("Rendering video at step %d", step)
+                    preds, *_ = lax.map(lambda x: p_eval_step(state, x), rays_render)
+                    gen_video(preds["rgb"], "rgb", r_hwf, step)
+                    preds_disp = preds["disp"] / np.max(preds["disp"])
+                    gen_video(preds_disp, "disp", r_hwf, step, ch=1)
 
-        ### Render a video with test poses
-        if step % FLAGS.config.i_video == 0 and step > 0:
-            logging.info("Rendering video at step %d", step)
-            t = time.time()
-            preds, *_ = lax.map(lambda x: p_eval_step(state, x), rays_render)
-            gen_video(preds["rgb"], "rgb", r_hwf, step)
-            gen_video(preds["disp"] / jnp.max(preds["disp"]), "disp", r_hwf, step, ch=1)
+                    if FLAGS.config.use_viewdirs:
+                        preds = lax.map(
+                            lambda x: p_eval_step(state, x)[0]["rgb"], rays_render_vdirs
+                        )
+                        gen_video(preds, "rgb_still", r_hwf, step)
 
-            if FLAGS.config.use_viewdirs:
-                preds = lax.map(
-                    lambda x: p_eval_step(state, x)[0]["rgb"], rays_render_vdirs
-                )
-                gen_video(preds, "rgb_still", r_hwf, step)
-            logging.info("Video rendering done in %ds", time.time() - t)
+            ### Save images in the test set
+            if step % FLAGS.config.i_testset == 0 and step > 0 or is_last_step:
+                with report_progress.timed("test_render"):
+                    logging.info("Rendering test set at step %d", step)
+                    preds, *_ = lax.map(lambda x: p_eval_step(state, x), test_rays)
+                    save_test_imgs(preds["rgb"], r_hwf, step)
 
-        ### Save images in the test set
-        if step % FLAGS.config.i_testset == 0 and step > 0:
-            logging.info("Rendering test set at step %d", step)
-            preds = lax.map(lambda x: p_eval_step(state, x)[0]["rgb"], test_rays)
-            save_test_imgs(preds, r_hwf, step)
+                    if FLAGS.config.render_factor == 0:
+                        loss = np.mean(
+                            (preds["rgb"].reshape(test_imgs.shape) - test_imgs) ** 2.0
+                        )
+                        writer.write_scalars(
+                            step, {"test/loss": loss, "test/psnr": psnr_fn(loss)}
+                        )
 
-            if FLAGS.config.render_factor == 0:
-                loss = np.mean((preds.reshape(test_imgs.shape) - test_imgs) ** 2.0)
-                summary_writer.scalar(f"test/loss", loss, step)
-                summary_writer.scalar(f"test/psnr", psnr_fn(loss), step)
-
-        ### Save ckpt
-        if step % FLAGS.config.i_weights == 0 and step > 0:
-            if jax.host_id() == 0:
-                checkpoints.save_checkpoint(
-                    FLAGS.model_dir,
-                    jax_utils.unreplicate(state),
-                    step,
-                    keep=5,
-                )
-        t = time.time()
+            ### Save ckpt
+            save_checkpoint = step % FLAGS.config.i_weights == 0 or is_last_step
+            if save_checkpoint and jax.host_id() == 0:
+                with report_progress.timed("checkpoint"):
+                    state_ = jax_utils.unreplicate(state)
+                    checkpoints.save_checkpoint(FLAGS.model_dir, state_, step, keep=5)
 
 
 if __name__ == "__main__":
