@@ -6,113 +6,7 @@ from flax import linen as nn
 from jax import numpy as jnp, lax, random
 
 
-@functools.partial(jax.jit, static_argnums=(0, 1, 2))
-def get_rays(img_h, img_w, focal, c2w):
-    """Get ray origins and directions from a pinhole camera.
-    Args:
-        img_h: height in pixels
-        img_w: width in pixels
-        focal: focal length of the pinhole camera
-        c2w: (3, 4) camera to world coordinate transformation matrix
-    Returns:
-        rays: (2, img_h * img_w, 3) stacked origin and direction rays
-    """
-    i, j = jnp.meshgrid(jnp.arange(img_w), jnp.arange(img_h), indexing="xy")
-
-    dirs = [(i - img_w * 0.5) / focal, -(j - img_h * 0.5) / focal, -jnp.ones_like(i)]
-    dirs = jnp.stack(dirs, axis=-1)
-
-    rays_d = jnp.einsum("ijl,kl", dirs, c2w[:, :3])
-    rays_o = jnp.broadcast_to(c2w[:, -1], rays_d.shape)
-    return jnp.stack([rays_o, rays_d])
-
-
-def ndc_rays(img_h, img_w, focal, near, rays_o, rays_d):
-    """Normalized device coordinate rays.
-    Space such that the canvas is a cube with sides [-1, 1] in each axis.
-    Args:
-        img_h: height in pixels
-        img_w: width in pixels
-        focal: focal length of the pinhole camera
-        near: near depth bound for the scene
-        rays_o: (num_rays, 3) origin rays
-        rays_d: (num_rays, 3) direction rays
-    Returns:
-        rays_o: (num_rays, 3) origin rays in NDC
-        rays_d: (num_rays, 3) direction rays in NDC
-    """
-    # shift ray origins to near plane
-    t = -(near + rays_o[..., 2]) / rays_d[..., 2]
-    rays_o = rays_o + t[..., None] * rays_d
-
-    # projection
-    o0 = -1.0 / (img_w / (2.0 * focal)) * rays_o[..., 0] / rays_o[..., 2]
-    o1 = -1.0 / (img_h / (2.0 * focal)) * rays_o[..., 1] / rays_o[..., 2]
-    o2 = 1.0 + 2.0 * near / rays_o[..., 2]
-
-    d0 = (
-        -1.0
-        / (img_w / (2.0 * focal))
-        * (rays_d[..., 0] / rays_d[..., 2] - rays_o[..., 0] / rays_o[..., 2])
-    )
-    d1 = (
-        -1.0
-        / (img_h / (2.0 * focal))
-        * (rays_d[..., 1] / rays_d[..., 2] - rays_o[..., 1] / rays_o[..., 2])
-    )
-    d2 = -2.0 * near / rays_o[..., 2]
-
-    rays_o = jnp.stack([o0, o1, o2], axis=-1)
-    rays_d = jnp.stack([d0, d1, d2], axis=-1)
-
-    return rays_o, rays_d
-
-
-def prepare_rays(rays, hwf, config, near=0.0, far=1.0, c2w=None, c2w_static_cam=None):
-    """
-    Build rays for rendering.
-    Args:
-        rays: (2, num_rays, 3) origin and direction generated rays
-        hwf: (3) tuple containing image height, width and focal length
-        config: model and rendering config
-        near: nearest distance for a ray
-        far: farthest distance for a ray
-        c2w: (3, 4) camera-to-world transformation matrix
-        c2w_static_cam: (3, 4) transformation matrix for camera
-    Returns:
-        rays: (img_h, img_w, *) generated rays
-    """
-    if c2w is not None:
-        # special case to render full image
-        rays_o, rays_d = get_rays(*hwf, c2w)
-    else:
-        rays_o, rays_d = rays
-
-    viewdirs = None
-    if config.use_viewdirs:
-        # provide ray directions as input
-        viewdirs = rays_d
-        if c2w_static_cam is not None:
-            # special case to visualize effect of viewdirs
-            rays_o, rays_d = get_rays(*hwf, c2w_static_cam)
-        # make all directions unit magnitude
-        viewdirs /= jnp.linalg.norm(viewdirs, axis=-1, keepdims=True)  # [num_rand, 3]
-
-    # for forward facing scenes
-    if config.llff.ndc and config.dataset_type == "llff":
-        rays_o, rays_d = ndc_rays(*hwf, 1.0, rays_o, rays_d)
-
-    near *= jnp.ones_like(rays_d[..., :1])
-    far *= jnp.ones_like(rays_d[..., :1])
-
-    if viewdirs is not None:
-        rays = jnp.concatenate([rays_o, rays_d, near, far, viewdirs], axis=-1)
-    else:
-        rays = jnp.concatenate([rays_o, rays_d, near, far], axis=-1)
-    return rays.astype(config.dtype)
-
-
-def render_rays(rays, config, rng=None):
+def render_rays(rays_o, rays_d, config, near, far, rng=None):
     """Render rays for the coarse model.
     Args:
         rays: (4, num_rays, *) generated rays
@@ -122,8 +16,6 @@ def render_rays(rays, config, rng=None):
         pts: (num_rays, num_samples, 3) points in space to evaluate model at
         z_vals: (num_rays, num_samples) depths of the sampled positions
     """
-    rays_o, rays_d, near, far = rays
-
     # decide where to sample along each ray, all rays will be sampled at the same times
     t_vals = jnp.linspace(0.0, 1.0, config.num_samples)
     if config.llff.lindisp and config.dataset_type == "llff":
@@ -151,7 +43,7 @@ def render_rays(rays, config, rng=None):
 
 
 def render_rays_fine(
-    rays, z_vals, weights, num_importance, perturbation=True, rng=None
+    rays_o, rays_d, z_vals, weights, num_importance, perturbation=True, rng=None
 ):
     """Render rays for the fine model.
     Args:
@@ -166,8 +58,6 @@ def render_rays_fine(
         z_vals: (num_rays, num_samples + num_importance) depths of the sampled positions
         z_samples: (num_rays) standard deviation of distances along ray for each sample
     """
-    rays_o, rays_d = rays
-
     z_vals_mid = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
     z_samples = sample_pdf(
         z_vals_mid, weights[..., 1:-1], num_importance, perturbation, rng

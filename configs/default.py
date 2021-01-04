@@ -47,32 +47,27 @@ def get_config():
     config.raw_noise_std = 0.0           # std dev of noise added to regularize sigma_a output, 1e0 recommended
     config.render_only = False           # do not optimize, reload weights and render out render_poses path
     config.render_test = False           # render the test set instead of render_poses path
-    config.render_factor = 0             # downsampling factor to speed up rendering, set 4 or 8 for fast preview
+    config.down_factor = 1               # downsampling factor for the dataset
+    config.render_factor = 1             # downsampling factor to speed up rendering, set 4 or 8 for fast preview
+    config.white_bkgd = False            # whether to render synthetic data on a white bkgd (mandatory for dvoxels)
 
     # dataset options
     config.dataset_type = "llff"         # options: llff / blender / deepvoxels
+    config.shape = "fern"                # scene in the dataset
     config.testskip = 8                  # will load 1/N images from test/val sets, useful for large datasets like deepvoxels
-
-    # deepvoxels flags
-    config.shape = "greek"               # options: armchair / cube / greek / vase
-
-    # blender flags
-    config.white_bkgd = False            # whether to render synthetic data on a white bkgd (mandatory for dvoxels)
-    config.half_res = False              # whether to load blender synthetic data at 400x400 instead of 800x800
+    config.num_poses = 40                # number of poses to generate for renders in "blender" and "llff"
 
     # llff flags
     config.llff = ml_collections.ConfigDict()
-    config.llff.factor = 8               # downsample factor for LLFF images
-    config.llff.ndc = True               # whether to use normalized device coordinates (set for non-forward facing scenes)
     config.llff.lindisp = False          # sampling linearly in disparity rather than depth
     config.llff.spherify = False         # set for spherical 360 scenes
     config.llff.hold = 8                 # will take every 1/N images as LLFF test set, paper uses 8
 
     # logging / saving options
     config.i_print = 100                 # frequency of console printout and metric logging
-    config.i_img = 500                   # frequency of TensorBoard image logging
+    config.i_img = 5000                  # frequency of TensorBoard image logging
     config.i_weights = 5000              # frequency of weight ckpt saving
-    config.i_testset = 50000             # frequency of testset saving
-    config.i_video = 50000               # frequency of render_poses video saving
+    config.i_testset = 1000000           # frequency of testset saving
+    config.i_video = 1000000             # frequency of render_poses video saving
 
     return config

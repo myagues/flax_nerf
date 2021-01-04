@@ -5,8 +5,7 @@ import jax
 from absl import logging
 from jax import numpy as jnp, lax, random
 
-from rays_utils import prepare_rays, raw2outputs, render_rays, render_rays_fine
-
+from rays_utils import raw2outputs, render_rays, render_rays_fine
 
 psnr_fn = lambda x: -10.0 * jnp.log(x) / jnp.log(10.0)
 
@@ -75,39 +74,43 @@ def create_learning_rate_scheduler(
 
 def train_step(
     model_fn,
+    near,
+    far,
     config,
     lr_fn,
-    hwfnf,
     state,
     batch,
     coords=None,
     rng=None,
 ):
     """Perform a single training step."""
-    rng_0, rng_1, rng_2, rng_3, rng_4 = random.split(rng, 5)
-    inputs, target = batch
-    hwf, near, far = hwfnf
-    apply_coarse, apply_fine = model_fn
+    rng = jax.random.fold_in(rng, state.step)
+    rng0, rng1, rng2, rng3, rng4 = random.split(rng, 5)
+    inputs, targets = batch["rays"], batch["image"]
+    model_coarse, model_fine = model_fn
     opt_coarse, opt_fine = state.optimizer_coarse, state.optimizer_fine
 
     if not config.batching:
-        rays = prepare_rays(None, hwf, config, near, far, inputs[:3, :4], None)
-        if coords is None:
-            coords = jnp.meshgrid(jnp.arange(hwf[0]), jnp.arange(hwf[1]), indexing="ij")
-            coords = jnp.stack(coords, axis=-1).reshape([-1, 2])
         select_idx = random.choice(
-            rng_0,
+            rng0,
             coords.shape[0],
             shape=[config.num_rand],
             replace=False,
         )
         select_idx = coords[select_idx]
-        rays = rays[select_idx[:, 0], select_idx[:, 1]]
-        target = target[select_idx[:, 0], select_idx[:, 1]]
+        rays = inputs[select_idx[:, 0], select_idx[:, 1]]
+        targets = targets[select_idx[:, 0], select_idx[:, 1]]
     else:
         rays = inputs
 
-    *rays, viewdirs = jnp.split(rays, [3, 6, 7, 8], axis=-1)
+    *rays, viewdirs = jnp.split(rays, [3, 6], axis=-1)
+    _, rays_d = rays
+
+    render_rays_fine_ = functools.partial(
+        render_rays_fine,
+        num_importance=config.num_importance,
+        perturbation=config.perturb,
+    )
     raw2outputs_ = functools.partial(
         raw2outputs,
         raw_noise_std=config.raw_noise_std,
@@ -116,23 +119,21 @@ def train_step(
 
     def loss_fn(params_coarse, params_fine=None):
         """Loss function used for training."""
-        pts, z_vals = render_rays(rays, config, rng_1)
-        raw_c = apply_coarse({"params": params_coarse}, pts, viewdirs).reshape(
+        pts, z_vals = render_rays(*rays, config, near, far, rng1)
+        raw_c = model_coarse({"params": params_coarse}, pts, viewdirs).reshape(
             [config.num_rand, config.num_samples, 4]
         )
-        coarse_res, weights = raw2outputs_(raw_c, z_vals, rays[1], rng=rng_2)
-        loss_c = jnp.mean((coarse_res["rgb"] - target) ** 2.0)
+        coarse_res, weights = raw2outputs_(raw_c, z_vals, rays_d, rng=rng2)
+        loss_c = jnp.mean((coarse_res["rgb"] - targets) ** 2.0)
 
         loss_f = 0
         if config.num_importance > 0:
-            pts, z_vals, _ = render_rays_fine(
-                rays[:2], z_vals, weights, config.num_importance, config.perturb, rng_3
-            )
-            raw_f = apply_fine({"params": params_fine}, pts, viewdirs).reshape(
+            pts, z_vals, _ = render_rays_fine_(*rays, z_vals, weights, rng=rng3)
+            raw_f = model_fine({"params": params_fine}, pts, viewdirs).reshape(
                 [config.num_rand, config.num_samples + config.num_importance, 4]
             )
-            fine_res, _ = raw2outputs_(raw_f, z_vals, rays[1], rng=rng_4)
-            loss_f = jnp.mean((fine_res["rgb"] - target) ** 2.0)
+            fine_res, _ = raw2outputs_(raw_f, z_vals, rays_d, rng=rng4)
+            loss_f = jnp.mean((fine_res["rgb"] - targets) ** 2.0)
 
         loss = loss_c + loss_f
         return loss, (loss_c, loss_f)
@@ -171,29 +172,31 @@ def train_step(
     return new_state, metrics
 
 
-def eval_step(model_fn, config, state, rays):
+def eval_step(model_fn, config, near, far, state, rays):
     apply_coarse, apply_fine = model_fn
     opt_coarse, opt_fine = state.optimizer_coarse, state.optimizer_fine
-
+    render_rays_fine_ = functools.partial(
+        render_rays_fine,
+        num_importance=config.num_importance,
+        perturbation=False,
+    )
     raw2outputs_ = functools.partial(
         raw2outputs,
         raw_noise_std=0.0,
         white_bkgd=config.white_bkgd,
     )
-    *rays, viewdirs = jnp.split(rays, [3, 6, 7, 8], axis=-1)
+    rays_o, rays_d, viewdirs = jnp.split(rays, [3, 6], axis=-1)
 
-    pts, z_vals = render_rays(rays, config)
+    pts, z_vals = render_rays(rays_o, rays_d, config, near, far)
     raw_c = apply_coarse({"params": opt_coarse.target}, pts, viewdirs)
     raw_c = jnp.reshape(raw_c, [-1, config.num_samples, 4])
-    coarse_res, weights = raw2outputs_(raw_c, z_vals, rays[1])
+    coarse_res, weights = raw2outputs_(raw_c, z_vals, rays_d)
 
     if config.num_importance > 0:
-        pts, z_vals, z_std = render_rays_fine(
-            rays[:2], z_vals, weights, config.num_importance, perturbation=False
-        )
+        pts, z_vals, z_std = render_rays_fine_(rays_o, rays_d, z_vals, weights)
         raw_f = apply_fine({"params": opt_fine.target}, pts, viewdirs)
         raw_f = jnp.reshape(raw_f, [-1, config.num_samples + config.num_importance, 4])
-        fine_res, _ = raw2outputs_(raw_f, z_vals, rays[1])
+        fine_res, _ = raw2outputs_(raw_f, z_vals, rays_d)
         return fine_res, coarse_res, z_std
 
     return coarse_res, None, None

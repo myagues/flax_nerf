@@ -1,68 +1,76 @@
 import functools
 import os
-import time
 
 import imageio
 import jax
 import numpy as np
+import tensorflow as tf
 
 from absl import app, flags, logging
-from clu import metric_writers, periodic_actions, platform
+from clu import metric_writers, parameter_overview, periodic_actions, platform
 from flax import jax_utils, optim, struct
 from flax.training import checkpoints, common_utils
-from jax import numpy as jnp, lax, random
+from jax import numpy as jnp, lax
 from jax.config import config as jax_config
 from ml_collections import config_flags
-from typing import Any, Optional
+from tqdm import tqdm
+from typing import Optional
 
-from datasets import load_blender, load_deepvoxels
+from datasets.input_pipeline import get_dataset
 from model import NeRF
-from rays_utils import prepare_rays
 from utils import create_learning_rate_scheduler, eval_step, train_step
 
 jax_config.enable_omnistaging()
+tf.config.experimental.set_visible_devices([], "GPU")
 
 FLAGS = flags.FLAGS
 
 config_flags.DEFINE_config_file(
-    "config",
-    os.path.join(os.path.dirname(__file__), "configs/default.py"),
-    "File path to the hyperparameter configuration.",
+    "config", None, "File path to the hyperparameter configuration."
 )
+flags.DEFINE_integer("seed", default=0, help="Initialization seed.")
+flags.DEFINE_string("data_dir", default=None, help="Directory containing data files.")
+flags.DEFINE_string("model_dir", default=None, help="Directory to store model data.")
 
-flags.DEFINE_integer("seed", default=0, help=("Initialization seed."))
-flags.DEFINE_string("data_dir", default=None, help=("Directory containing data files."))
-flags.DEFINE_string("model_dir", default=None, help=("Directory to store model data."))
-flags.DEFINE_string(
-    "jax_backend_target",
-    default=None,
-    help=("JAX backend target to use. Can be used with UPTC."),
+to_np = (
+    lambda x, y, z: np.asarray(x)
+    .reshape(1, y[0] + z, y[1], -1)
+    .astype(np.float32)[:, z:]
 )
-
 to_rgb = lambda x: (255 * np.clip(np.asarray(x), 0, 1)).astype(np.uint8)
 psnr_fn = lambda x: -10.0 * np.log(x) / np.log(10.0)
+
+
+def disp_post(disp, config):
+    if config.dataset_type == "llff":
+        disp = (disp - disp.min()) / np.clip(disp.max() - disp.min(), 1e-5, None)
+    return disp
+
+
+def prepare_render_data(rays):
+    padding = 0
+    img_h, img_w, chn = rays.shape
+    rays_remaining = np.prod(img_h) % jax.local_device_count()
+    if rays_remaining != 0:
+        padding = jax.local_device_count() - rays_remaining
+        rays = np.pad(rays, ((padding, 0), (0, 0), (0, 0)), mode="edge")
+    return rays.reshape(jax.local_device_count(), -1, img_w, chn), padding
 
 
 def gen_video(data, filename, hwf, step, ch=3):
     img_h, img_w, _ = hwf
     data = to_rgb(data.reshape([-1, img_h, img_w, ch]))
     imageio.mimwrite(
-        os.path.join(FLAGS.model_dir, f"{filename}_{step:06d}.mp4"),
-        data.astype(np.uint8),
-        fps=30,
-        quality=8,
+        os.path.join(FLAGS.model_dir, f"{filename}_{step:06d}.mp4"), data, fps=30
     )
 
 
-def save_test_imgs(data, hwf, step, ch=3):
+def save_test_imgs(data, hwf, step, idx, ch=3):
     img_h, img_w, _ = hwf
-    data = to_rgb(data.reshape([-1, img_h, img_w, ch]))
+    data = to_rgb(data.reshape([img_h, img_w, ch]))
     save_path = os.path.join(FLAGS.model_dir, f"testset_{step:06d}")
     os.makedirs(save_path, exist_ok=True)
-    [
-        imageio.imwrite(os.path.join(save_path, f"{idx:02d}.png"), x)
-        for idx, x in enumerate(data.astype(np.uint8))
-    ]
+    imageio.imwrite(os.path.join(save_path, f"{idx:02d}.png"), data)
 
 
 def initialized(key, input_pts_shape, input_viewdirs_shape, model_config):
@@ -88,10 +96,9 @@ class TrainState:
 
 
 def main(_):
-    if FLAGS.jax_backend_target:
-        logging.info("Using JAX backend target %s", FLAGS.jax_backend_target)
-        jax_config.update("jax_xla_backend", "tpu_driver")
-        jax_config.update("jax_backend_target", FLAGS.jax_backend_target)
+    if FLAGS.config.precrop_iters > 0 and FLAGS.config.batching:
+        raise ValueError("'precrop_iters has no effect when 'batching' the dataset")
+    assert FLAGS.config.down_factor > 0 and FLAGS.config.render_factor > 0
 
     logging.info("JAX host: %d / %d", jax.host_id(), jax.host_count())
     logging.info("JAX local devices: %r", jax.local_devices())
@@ -100,97 +107,31 @@ def main(_):
         f"host_id: {jax.host_id()}, host_count: {jax.host_count()}"
     )
     platform.work_unit().create_artifact(
-        platform.ArtifactType.DIRECTORY, FLAGS.model_dir, "workdir"
+        platform.ArtifactType.DIRECTORY, FLAGS.model_dir, "model_dir"
     )
 
     os.makedirs(FLAGS.model_dir, exist_ok=True)
-    rng = random.PRNGKey(FLAGS.seed)
-    rng, init_rng_coarse, init_rng_fine = random.split(rng, 3)
-    n_devices = jax.device_count()
+    rng = jax.random.PRNGKey(FLAGS.seed)
+    rng, init_rng_coarse, init_rng_fine, data_rng, step_rng = jax.random.split(rng, 5)
+    rngs = common_utils.shard_prng_key(step_rng)
 
     ### Load dataset and data values
-    if FLAGS.config.dataset_type == "blender":
-        images, poses, render_poses, hwf, counts = load_blender.load_data(
-            FLAGS.data_dir,
-            half_res=FLAGS.config.half_res,
-            testskip=FLAGS.config.testskip,
-        )
-        logging.info("Loaded blender, total images: %d", images.shape[0])
-
-        near = 2.0
-        far = 6.0
-
-        if FLAGS.config.white_bkgd:
-            images = images[..., :3] * images[..., -1:] + (1.0 - images[..., -1:])
-        else:
-            images = images[..., :3]
-
-    elif FLAGS.config.dataset_type == "deepvoxels":
-        images, poses, render_poses, hwf, counts = load_deepvoxels.load_dv_data(
-            FLAGS.data_dir,
-            scene=FLAGS.config.shape,
-            testskip=FLAGS.config.testskip,
-        )
-        hemi_R = np.mean(np.linalg.norm(poses[:, :3, -1], axis=-1))
-        near = hemi_R - 1.0
-        far = hemi_R + 1.0
-        logging.info(
-            "Loaded deepvoxels (%s), total images: %d",
-            FLAGS.config.shape,
-            images.shape[0],
-        )
-    else:
-        raise ValueError(f"Dataset '{FLAGS.config.dataset_type}' is not available.")
-
-    img_h, img_w, focal = hwf
-    logging.info("Images splits: %s", counts)
-    logging.info("Render poses: %s", render_poses.shape)
-    logging.info("Image height: %d, image width: %d, focal: %.5f", img_h, img_w, focal)
-
-    train_imgs, val_imgs, test_imgs, *_ = np.split(images, np.cumsum(counts))
-    train_poses, val_poses, test_poses, *_ = np.split(poses, np.cumsum(counts))
-
-    if FLAGS.config.render_factor > 0:
-        # render downsampled for speed
-        r_img_h = img_h // FLAGS.config.render_factor
-        r_img_w = img_w // FLAGS.config.render_factor
-        r_focal = focal / FLAGS.config.render_factor
-        r_hwf = r_img_h, r_img_w, r_focal
-    else:
-        r_hwf = hwf
-
-    to_np = (
-        lambda x, h=img_h, w=img_w: np.asarray(x)
-        .reshape(1, h, w, -1)
-        .astype(np.float32)
+    datasets, counts, optics, render_datasets = get_dataset(
+        FLAGS.data_dir, FLAGS.config, rng=data_rng, num_poses=FLAGS.config.num_poses
     )
+    train_ds, val_ds, test_ds = datasets
+    *_, test_items = counts
+    hwf, r_hwf, near, far = optics
+    render_ds, render_vdirs_ds, num_poses = render_datasets
+    iter_render_ds = zip(range(num_poses), render_ds)
+    iter_vdirs_ds = zip(range(num_poses), render_vdirs_ds)
+    iter_test_ds = zip(range(test_items), test_ds)
+    img_h, img_w, _ = hwf
 
-    ### Pre-compute rays
-    @functools.partial(jax.jit, static_argnums=(0,))
-    def prep_rays(hwf, c2w, c2w_sc=None):
-        if c2w_sc is not None:
-            c2w_sc = c2w_sc[:3, :4]
-        return prepare_rays(None, hwf, FLAGS.config, near, far, c2w[:3, :4], c2w_sc)
-
-    rays_render = lax.map(lambda x: prep_rays(r_hwf, x), render_poses)
-    render_shape = [-1, n_devices, r_hwf[1], rays_render.shape[-1]]
-    rays_render = jnp.reshape(rays_render, render_shape)
-    logging.info("Render rays shape: %s", rays_render.shape)
-
-    if FLAGS.config.use_viewdirs:
-        rays_render_vdirs = lax.map(
-            lambda x: prep_rays(r_hwf, x, render_poses[0]), render_poses
-        ).reshape(render_shape)
-
-    if FLAGS.config.batching:
-        train_rays = lax.map(lambda pose: prep_rays(hwf, pose), train_poses)
-        train_rays = jnp.reshape(train_rays, [-1, train_rays.shape[-1]])
-        train_imgs = jnp.reshape(train_imgs, [-1, 3])
-        logging.info("Batched rays shape: %s", train_rays.shape)
-        val_rays = lax.map(lambda pose: prep_rays(hwf, pose), val_poses)
-
-    test_rays = lax.map(lambda pose: prep_rays(r_hwf, pose), test_poses)
-    test_rays = jnp.reshape(test_rays, render_shape)
+    logging.info("Num poses: %d", num_poses)
+    logging.info("Splits: train - %d, val - %d, test - %d", *counts)
+    logging.info("Images: height %d, width %d, focal %.5f", *hwf)
+    logging.info("Render: height %d, width %d, focal %.5f", *r_hwf)
 
     ### Init model parameters and optimizer
     input_pts_shape = (FLAGS.config.num_rand, FLAGS.config.num_samples, 3)
@@ -198,7 +139,6 @@ def main(_):
     model_coarse, params_coarse = initialized(
         init_rng_coarse, input_pts_shape, input_views_shape, FLAGS.config.model
     )
-
     optimizer = optim.Adam()
     state = TrainState(
         step=0, optimizer_coarse=optimizer.create(params_coarse), optimizer_fine=None
@@ -219,28 +159,42 @@ def main(_):
 
     state = checkpoints.restore_checkpoint(FLAGS.model_dir, state)
     start_step = int(state.step)
+    # cycle already seen examples if resuming from checkpoint
+    # (only useful for deterministic data)
+    if start_step != 0:
+        _ = [next(train_ds) for _ in range(start_step)]
+    # parameter_overview.log_parameter_overview(state.optimizer_coarse.target)
+    # if FLAGS.config.num_importance > 0:
+    #     parameter_overview.log_parameter_overview(state.optimizer_fine.target)
+
     state = jax_utils.replicate(state)
 
-    ### Build 'pmapped' functions for distributed training
+    ### Build "pmapped" functions for distributed training
     learning_rate_fn = create_learning_rate_scheduler(
         factors=FLAGS.config.lr_schedule,
         base_learning_rate=FLAGS.config.learning_rate,
         decay_factor=FLAGS.config.decay_factor,
         steps_per_decay=FLAGS.config.lr_decay * 1000,
     )
-    p_train_step = jax.pmap(
-        functools.partial(
-            train_step,
-            model_fn,
-            FLAGS.config,
-            learning_rate_fn,
-            (hwf, near, far),
-        ),
-        axis_name="batch",
+    train_fn = functools.partial(
+        train_step, model_fn, near, far, FLAGS.config, learning_rate_fn
     )
-    p_eval_step = jax.pmap(
-        functools.partial(eval_step, model_fn, FLAGS.config),
+    p_train_step = jax.pmap(
+        train_fn,
         axis_name="batch",
+        in_axes=(0, 0, None, 0),
+        # donate_argnums=(0, 1, 2),
+    )
+
+    def render_fn(state, rays):
+        step_fn = functools.partial(eval_step, model_fn, FLAGS.config, near, far, state)
+        return lax.map(step_fn, rays)
+
+    p_eval_step = jax.pmap(
+        render_fn,
+        axis_name="batch",
+        # in_axes=(0, 0, None),
+        # donate_argnums=(0, 1))
     )
 
     writer = metric_writers.create_default_writer(
@@ -261,28 +215,12 @@ def main(_):
         for step in range(start_step, FLAGS.config.num_steps + 1):
             is_last_step = step == FLAGS.config.num_steps
 
-            rng, sample_rng, step_rng, test_rng = random.split(rng, 4)
-            sharded_rngs = common_utils.shard_prng_key(step_rng)
+            batch = next(train_ds)
             coords = None
-
-            if FLAGS.config.batching:
-                select_idx = random.randint(
-                    sample_rng,
-                    [n_devices * FLAGS.config.num_rand],
-                    minval=0,
-                    maxval=train_rays.shape[0],
+            if not FLAGS.config.batching:
+                coords = jnp.meshgrid(
+                    jnp.arange(img_h), jnp.arange(img_w), indexing="ij"
                 )
-                inputs = train_rays[select_idx, ...]
-                inputs = jnp.reshape(inputs, [n_devices, FLAGS.config.num_rand, -1])
-                target = train_imgs[select_idx, ...]
-                target = jnp.reshape(target, [n_devices, FLAGS.config.num_rand, 3])
-            else:
-                img_idx = random.randint(
-                    sample_rng, [n_devices], minval=0, maxval=counts[0]
-                )
-                inputs = train_poses[img_idx, ...]  # [n_devices, 4, 4]
-                target = train_imgs[img_idx, ...]  # [n_devices, img_h, img_w, 3]
-
                 if step < FLAGS.config.precrop_iters:
                     dH = int(img_h // 2 * FLAGS.config.precrop_frac)
                     dW = int(img_w // 2 * FLAGS.config.precrop_frac)
@@ -291,15 +229,11 @@ def main(_):
                         jnp.arange(img_w // 2 - dW, img_w // 2 + dW),
                         indexing="ij",
                     )
-                    coords = jax_utils.replicate(
-                        jnp.stack(coords, axis=-1).reshape([-1, 2])
-                    )
+                coords = jnp.stack(coords, axis=-1).reshape([-1, 2])
 
             with jax.profiler.StepTraceContext("train", step_num=step):
-                state, metrics = p_train_step(
-                    state, (inputs, target), coords, rng=sharded_rngs
-                )
-                train_metrics.append(metrics)
+                state, metrics = p_train_step(state, batch, coords, rngs)
+            train_metrics.append(metrics)
 
             logging.log_first_n(logging.INFO, "Finished training step %d.", 5, step)
             _ = [h(step) for h in hooks]
@@ -316,60 +250,70 @@ def main(_):
             ### Eval a random validation image and plot it to TB
             if step % FLAGS.config.i_img == 0 and step > 0 or is_last_step:
                 with report_progress.timed("validation"):
-                    val_idx = random.randint(test_rng, [1], minval=0, maxval=counts[1])
-                    if FLAGS.config.batching:
-                        inputs = val_rays[tuple(val_idx)].reshape(render_shape)
-                    else:
-                        inputs = prep_rays(hwf, val_poses[tuple(val_idx)])
-                        inputs = jnp.reshape(inputs, render_shape)
-                    target = val_imgs[tuple(val_idx)]
-                    outputs = lax.map(lambda x: p_eval_step(state, x), inputs)
-                    preds, preds_c, z_std = jax.tree_map(to_np, outputs)
-                    loss = np.mean((preds["rgb"] - target) ** 2)
+                    inputs = next(val_ds)
+                    rays, padding = prepare_render_data(inputs["rays"]._numpy())
+                    outputs = p_eval_step(state, rays)
+                    preds, preds_c, z_std = jax.tree_map(
+                        lambda x: to_np(x, hwf, padding), outputs
+                    )
+                    loss = np.mean((preds["rgb"] - inputs["image"]) ** 2)
                     summary = {"val/loss": loss, "val/psnr": psnr_fn(loss)}
                     writer.write_scalars(step, summary)
 
                     summary = {
                         "val/rgb": to_rgb(preds["rgb"]),
-                        "val/target": to_np(target),
-                        "val/disp": preds["disp"],
+                        "val/target": to_np(inputs["image"], hwf, padding),
+                        "val/disp": disp_post(preds["disp"], FLAGS.config),
                         "val/acc": preds["acc"],
                     }
                     if FLAGS.config.num_importance > 0:
                         summary["val/rgb_c"] = to_rgb(preds_c["rgb"])
-                        summary["val/disp_c"] = preds_c["disp"]
+                        summary["val/disp_c"] = disp_post(preds["disp_c"], FLAGS.config)
                         summary["val/z_std"] = z_std
                     writer.write_images(step, summary)
 
             ### Render a video with test poses
-            if step % FLAGS.config.i_video == 0 and step > 0 or is_last_step:
+            if step % FLAGS.config.i_video == 0 and step > 0:
                 with report_progress.timed("video_render"):
                     logging.info("Rendering video at step %d", step)
-                    preds, *_ = lax.map(lambda x: p_eval_step(state, x), rays_render)
-                    gen_video(preds["rgb"], "rgb", r_hwf, step)
-                    preds_disp = preds["disp"] / np.max(preds["disp"])
-                    gen_video(preds_disp, "disp", r_hwf, step, ch=1)
+                    rgb_list = []
+                    disp_list = []
+                    for idx, inputs in tqdm(iter_render_ds, desc="Rays render"):
+                        rays, padding = prepare_render_data(inputs["rays"]._numpy())
+                        preds, *_ = p_eval_step(state, rays)
+                        preds = jax.tree_map(lambda x: to_np(x, r_hwf, padding), preds)
+                        rgb_list.append(preds["rgb"])
+                        disp_list.append(preds["disp"])
+
+                    gen_video(np.stack(rgb_list), "rgb", r_hwf, step)
+                    disp = np.stack(disp_list)
+                    gen_video(disp_post(disp, FLAGS.config), "disp", r_hwf, step, ch=1)
 
                     if FLAGS.config.use_viewdirs:
-                        preds = lax.map(
-                            lambda x: p_eval_step(state, x)[0]["rgb"], rays_render_vdirs
-                        )
-                        gen_video(preds, "rgb_still", r_hwf, step)
+                        rgb_list = []
+                        for idx, inputs in tqdm(iter_vdirs_ds, desc="Viewdirs render"):
+                            rays, padding = prepare_render_data(inputs["rays"]._numpy())
+                            preds, *_ = p_eval_step(state, rays)
+                            rgb_list.append(to_np(preds["rgb"], r_hwf, padding))
+                        gen_video(np.stack(rgb_list), "rgb_still", r_hwf, step)
 
             ### Save images in the test set
-            if step % FLAGS.config.i_testset == 0 and step > 0 or is_last_step:
+            if step % FLAGS.config.i_testset == 0 and step > 0:
                 with report_progress.timed("test_render"):
                     logging.info("Rendering test set at step %d", step)
-                    preds, *_ = lax.map(lambda x: p_eval_step(state, x), test_rays)
-                    save_test_imgs(preds["rgb"], r_hwf, step)
+                    test_losses = []
+                    for idx, inputs in tqdm(iter_test_ds, desc="Test render"):
+                        rays, padding = prepare_render_data(inputs["rays"]._numpy())
+                        preds, *_ = p_eval_step(state, rays)
+                        save_test_imgs(preds["rgb"], r_hwf, step, idx)
 
+                        if FLAGS.config.render_factor == 0:
+                            loss = np.mean((preds["rgb"] - inputs["image"]) ** 2.0)
+                            test_losses.append(loss)
                     if FLAGS.config.render_factor == 0:
-                        loss = np.mean(
-                            (preds["rgb"].reshape(test_imgs.shape) - test_imgs) ** 2.0
-                        )
-                        writer.write_scalars(
-                            step, {"test/loss": loss, "test/psnr": psnr_fn(loss)}
-                        )
+                        loss = np.mean(test_losses)
+                        summary = {"test/loss": loss, "test/psnr": psnr_fn(loss)}
+                        writer.write_scalars(step, summary)
 
             ### Save ckpt
             save_checkpoint = step % FLAGS.config.i_weights == 0 or is_last_step
@@ -380,7 +324,6 @@ def main(_):
 
 
 if __name__ == "__main__":
-    flags.mark_flag_as_required("model_dir")
-    flags.mark_flag_as_required("data_dir")
+    flags.mark_flags_as_required(["data_dir", "config", "model_dir"])
     logging.set_verbosity(logging.INFO)
     app.run(main)
