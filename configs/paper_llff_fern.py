@@ -6,9 +6,9 @@ def get_config():
     config = default_lib.get_config()
 
     config.dataset_type = "llff"
-
-    config.llff.factor = 4
+    config.shape = "fern"
     config.llff.hold = 8
+    config.down_factor = 4
 
     config.num_importance = 128
     config.num_rand = 4096
@@ -17,5 +17,6 @@ def get_config():
     config.lr_decay = 250
     config.raw_noise_std = 1.0
     config.use_viewdirs = True
+    config.num_poses = 120
 
     return config

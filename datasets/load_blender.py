@@ -2,13 +2,10 @@ import functools
 import json
 import os
 
-import imageio
-import jax
-
 import numpy as np
+import tensorflow as tf
 
-from absl import logging
-from PIL import Image
+AUTOTUNE = tf.data.experimental.AUTOTUNE
 
 trans_t = lambda t: np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, t], [0, 0, 0, 1]])
 
@@ -36,48 +33,77 @@ def pose_spherical(theta, phi, radius):
     c2w = rot_phi(phi / 180.0 * np.pi) @ c2w
     c2w = rot_theta(theta / 180.0 * np.pi) @ c2w
     c2w = np.array([[-1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]]) @ c2w
-    return c2w
+    return c2w.astype(np.float32)
 
 
-def load_data(dataset_dir, half_res=True, testskip=1):
-    splits = ["train", "val", "test"]
+def get_image_data(file_path, pose, factor, camera_angle_x, white_bkgd):
+    img = tf.io.decode_png(tf.io.read_file(file_path))
+    img = tf.image.convert_image_dtype(img, dtype=tf.float32)
 
-    all_imgs, all_poses = [], []
-    counts = []
-    for split in splits:
-        with open(os.path.join(dataset_dir, f"transforms_{split}.json"), "r") as fp:
-            meta = json.load(fp)
+    height, width, _ = tf.unstack(tf.shape(img))
+    focal = 0.5 * float(height) / tf.math.tan(0.5 * camera_angle_x)
 
-        imgs, poses = [], []
-        skip = 1 if split == "train" or testskip == 0 else testskip
-        logging.info(
-            "Reading data for split %s: %d images", split, len(meta["frames"][::skip])
-        )
-        for frame in meta["frames"][::skip]:
-            fname = os.path.join(dataset_dir, f"{frame['file_path']}.png")
-            imgs.append(Image.open(fname))
-            poses.append(np.array(frame["transform_matrix"]))
+    if factor > 1:
+        height //= factor
+        width //= factor
+        focal /= float(factor)
+        img = tf.image.resize(img, [height, width], method=tf.image.ResizeMethod.AREA)
 
-        all_imgs.extend(imgs)
-        all_poses.extend(poses)
-        counts.append(len(imgs))
+    if white_bkgd:
+        img = img[..., :3] * img[..., -1:] + (1.0 - img[..., -1:])
+    else:
+        img = img[..., :3]
+    return {"image": img, "pose": pose, "hwf": (height, width, focal)}
 
-    img_height, img_width = imgs[0].size
-    focal = 0.5 * img_width / np.tan(0.5 * float(meta["camera_angle_x"]))
 
-    if half_res:
-        img_height //= 2
-        img_width //= 2
-        focal /= 2.0
-        all_imgs = list(map(lambda x: x.resize((img_height, img_width)), all_imgs))
+def load_data(data_dir, split, config, factor):
 
-    all_imgs = (np.stack(all_imgs) / 255.0).astype(np.float32)
-    all_poses = np.stack(all_poses).astype(np.float32)
+    with open(os.path.join(data_dir, f"transforms_{split}.json"), "r") as fp:
+        meta = json.load(fp)
 
-    render_poses = map(
-        lambda angle: pose_spherical(angle, -30.0, 4.0),
-        np.linspace(-180, 180, 40, endpoint=False),
+    skip = 1 if split == "train" or config.testskip == 0 else config.testskip
+
+    camera_angle_x = float(meta["camera_angle_x"])
+    fnames = []
+    poses = []
+    for frame in meta["frames"][::skip]:
+        fnames.append(os.path.join(data_dir, f"{frame['file_path']}.png"))
+        poses.append(np.array(frame["transform_matrix"], dtype=np.float32))
+
+    map_fn = functools.partial(
+        get_image_data,
+        factor=factor,
+        camera_angle_x=camera_angle_x,
+        white_bkgd=config.white_bkgd,
     )
-    render_poses = np.stack(list(render_poses))
+    dataset = tf.data.Dataset.from_tensor_slices((fnames, poses))
+    counts = dataset.cardinality().numpy()
+    dataset = dataset.map(map_fn, num_parallel_calls=AUTOTUNE)
+    return dataset, counts
 
-    return all_imgs, all_poses, render_poses, (img_height, img_width, focal), counts
+
+def get_blender(data_dir, config, num_poses=40):
+    near = 2.0
+    far = 6.0
+    data_dir = os.path.join(data_dir, config.shape)
+    load_data_fn = functools.partial(load_data, data_dir, config=config)
+    train_ds, train_items = load_data_fn("train", factor=config.down_factor)
+    val_ds, val_items = load_data_fn("val", factor=config.down_factor)
+    test_ds, test_items = load_data_fn(
+        "test", factor=(config.down_factor * config.render_factor)
+    )
+
+    datasets = [train_ds, val_ds, test_ds]
+    counts = [train_items, val_items, test_items]
+    hwf = next(iter(train_ds))["hwf"]
+    r_hwf = next(iter(test_ds))["hwf"]
+    optics = hwf, r_hwf, near, far
+
+    angles = np.linspace(-180, 180, num_poses, endpoint=False)
+    render_poses = map(lambda x: pose_spherical(x, -30.0, 4.0), angles)
+    render_poses_ds = tf.data.Dataset.from_tensor_slices(list(render_poses))
+    static_pose = next(iter(render_poses_ds))
+    render_poses_ds = render_poses_ds.map(
+        lambda x: {"image": False, "pose": x, "hwf": r_hwf}, num_parallel_calls=AUTOTUNE
+    )
+    return datasets, counts, optics, render_poses_ds, static_pose.numpy(), num_poses

@@ -1,5 +1,4 @@
 from configs import default as default_lib
-from jax import numpy as jnp
 
 
 def get_config():
@@ -7,6 +6,7 @@ def get_config():
     config = default_lib.get_config()
 
     config.dataset_type = "blender"
+    config.shape = "lego"
 
     config.batching = False
     config.num_importance = 128
