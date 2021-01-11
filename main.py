@@ -193,8 +193,8 @@ def main(_):
     test_rays = jnp.reshape(test_rays, render_shape)
 
     ### Init model parameters and optimizer
-    input_pts_shape = (FLAGS.config.num_rand, FLAGS.config.num_samples, 3)
-    input_views_shape = (FLAGS.config.num_rand, 3)
+    input_pts_shape = (FLAGS.config.num_samples, 3)
+    input_views_shape = (3,)
     model_coarse, params_coarse = initialized(
         init_rng_coarse, input_pts_shape, input_views_shape, FLAGS.config.model
     )
@@ -206,11 +206,7 @@ def main(_):
     model_fn = (model_coarse.apply, None)
 
     if FLAGS.config.num_importance > 0:
-        input_pts_shape = (
-            FLAGS.config.num_rand,
-            FLAGS.config.num_importance + FLAGS.config.num_samples,
-            3,
-        )
+        input_pts_shape = (FLAGS.config.num_importance + FLAGS.config.num_samples, 3)
         model_fine, params_fine = initialized(
             init_rng_fine, input_pts_shape, input_views_shape, FLAGS.config.model_fine
         )

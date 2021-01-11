@@ -84,7 +84,7 @@ def train_step(
     rng=None,
 ):
     """Perform a single training step."""
-    rng_0, rng_1, rng_2, rng_3, rng_4 = random.split(rng, 5)
+    rng_0, rng_1 = random.split(rng)
     inputs, target = batch
     hwf, near, far = hwfnf
     apply_coarse, apply_fine = model_fn
@@ -113,27 +113,31 @@ def train_step(
         raw_noise_std=config.raw_noise_std,
         white_bkgd=config.white_bkgd,
     )
+    render_rays_fine_ = functools.partial(render_rays_fine, num_importance=config.num_importance, perturbation=config.perturb)
+
+    def render_model(params_coarse, params_fine, rays_o, rays_d, viewdirs, rng):
+        rng_0, rng_1, rng_2, rng_3 = random.split(rng, 4)
+        pts, z_vals = render_rays(rays_o, rays_d, near, far, config, rng_0)
+        raw_c = apply_coarse({"params": params_coarse}, pts, viewdirs)
+        coarse_res, weights = raw2outputs_(raw_c, z_vals, rays_d, rng_1)
+        if config.num_importance > 0:
+            pts, z_vals, _ = render_rays_fine_(rays_o, rays_d, z_vals, weights, rng_2)
+            raw_f = apply_fine({"params": params_fine}, pts, viewdirs)
+            fine_res, _ = raw2outputs_(raw_f, z_vals, rays_d, rng_3)
+        else:
+            fine_res = None
+        return coarse_res, fine_res
 
     def loss_fn(params_coarse, params_fine=None):
         """Loss function used for training."""
-        pts, z_vals = render_rays(rays, config, rng_1)
-        raw_c = apply_coarse({"params": params_coarse}, pts, viewdirs).reshape(
-            [config.num_rand, config.num_samples, 4]
-        )
-        coarse_res, weights = raw2outputs_(raw_c, z_vals, rays[1], rng=rng_2)
+        rngs = random.split(rng_1, config.num_rand)
+        v_render_model = jax.vmap(functools.partial(render_model, params_coarse, params_fine))
+        coarse_res, fine_res = v_render_model(rays[0], rays[1], viewdirs, rngs)
         loss_c = jnp.mean((coarse_res["rgb"] - target) ** 2.0)
 
         loss_f = 0
         if config.num_importance > 0:
-            pts, z_vals, _ = render_rays_fine(
-                rays[:2], z_vals, weights, config.num_importance, config.perturb, rng_3
-            )
-            raw_f = apply_fine({"params": params_fine}, pts, viewdirs).reshape(
-                [config.num_rand, config.num_samples + config.num_importance, 4]
-            )
-            fine_res, _ = raw2outputs_(raw_f, z_vals, rays[1], rng=rng_4)
             loss_f = jnp.mean((fine_res["rgb"] - target) ** 2.0)
-
         loss = loss_c + loss_f
         return loss, (loss_c, loss_f)
 

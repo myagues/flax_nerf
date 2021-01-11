@@ -32,9 +32,9 @@ class NeRF(nn.Module):
         else:
             freq_bands = jnp.linspace(2.0 ** 0.0, 2.0 ** max_freq_log2, num_freqs)
 
-        inputs_freq = vmap(lambda x: inputs * x)(freq_bands)
-        fns = jnp.stack([fn(inputs_freq) for fn in self.periodic_fns])
-        fns = fns.swapaxes(0, 2).reshape([features_chn, -1])
+        inputs_freq = vmap(lambda x: inputs * x, out_axes=1)(freq_bands)
+        fns = jnp.stack([fn(inputs_freq) for fn in self.periodic_fns], axis=-2)
+        fns = fns.reshape([features_chn, -1])
 
         if self.include_input:
             fns = jnp.concatenate([inputs, fns], axis=-1)
@@ -43,9 +43,8 @@ class NeRF(nn.Module):
     # @nn.remat
     @nn.compact
     def __call__(self, inputs_pts, inputs_views):
-        assert inputs_pts.shape[2] == self.input_channels
+        assert inputs_pts.shape[1] == self.input_channels
         inputs_pts_shape = inputs_pts.shape
-        inputs_pts = jnp.reshape(inputs_pts, [-1, self.input_channels])
 
         if self.use_embed:
             inputs_pts = self.embed(inputs_pts, self.multires)
@@ -59,9 +58,8 @@ class NeRF(nn.Module):
                 x = jnp.concatenate([x, inputs_pts], axis=-1)
 
         if self.use_viewdirs:
-            assert inputs_views.shape[1] == self.input_channels
-            inputs_views = jnp.broadcast_to(inputs_views[:, None], inputs_pts_shape)
-            inputs_views = jnp.reshape(inputs_views, [-1, self.input_channels])
+            assert inputs_views.shape[0] == self.input_channels
+            inputs_views = jnp.broadcast_to(inputs_views[None], inputs_pts_shape)
 
             if self.use_embed:
                 inputs_views = self.embed(inputs_views, self.multires_views)

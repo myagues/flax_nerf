@@ -17,7 +17,7 @@ def get_config():
     config.use_viewdirs = True
     config.white_bkgd = True
 
-    config.i_print = 500
+    config.i_print = 50
     config.i_img = 5000
     config.render_factor = 2
 
