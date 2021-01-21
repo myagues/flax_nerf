@@ -14,7 +14,6 @@ from jax import numpy as jnp, lax
 from jax.config import config as jax_config
 from ml_collections import config_flags
 from tqdm import tqdm
-from typing import Optional
 
 from datasets.input_pipeline import get_dataset
 from model import NeRF
@@ -73,17 +72,17 @@ def save_test_imgs(data, hwf, step, idx, ch=3):
     imageio.imwrite(os.path.join(save_path, f"{idx:02d}.png"), data)
 
 
-def initialized(key, input_pts_shape, input_viewdirs_shape, model_config):
+def initialized(key, pts_shape, viewdirs_shape, model_config):
     model = NeRF(
         **model_config,
         **FLAGS.config.emb,
         use_viewdirs=FLAGS.config.use_viewdirs,
         dtype=FLAGS.config.dtype,
     )
-    initial_params = model.init(
+    initial_params = jax.jit(model.init)(
         {"params": key},
-        jnp.ones(input_pts_shape, model.dtype),
-        jnp.ones(input_viewdirs_shape, model.dtype),
+        jnp.ones(pts_shape, model.dtype),
+        jnp.ones(viewdirs_shape, model.dtype),
     )
     return model, initial_params["params"]
 
@@ -91,8 +90,7 @@ def initialized(key, input_pts_shape, input_viewdirs_shape, model_config):
 @struct.dataclass
 class TrainState:
     step: int
-    optimizer_coarse: optim.Optimizer
-    optimizer_fine: Optional[optim.Optimizer]
+    optimizer: optim.Optimizer
 
 
 def main(_):
@@ -112,7 +110,7 @@ def main(_):
 
     os.makedirs(FLAGS.model_dir, exist_ok=True)
     rng = jax.random.PRNGKey(FLAGS.seed)
-    rng, init_rng_coarse, init_rng_fine, data_rng, step_rng = jax.random.split(rng, 5)
+    rng, rng_coarse, rng_fine, data_rng, step_rng = jax.random.split(rng, 5)
     rngs = common_utils.shard_prng_key(step_rng)
 
     ### Load dataset and data values
@@ -134,27 +132,24 @@ def main(_):
     logging.info("Render: height %d, width %d, focal %.5f", *r_hwf)
 
     ### Init model parameters and optimizer
-    input_pts_shape = (FLAGS.config.num_rand, FLAGS.config.num_samples, 3)
-    input_views_shape = (FLAGS.config.num_rand, 3)
-    model_coarse, params_coarse = initialized(
-        init_rng_coarse, input_pts_shape, input_views_shape, FLAGS.config.model
-    )
+    initialized_ = functools.partial(initialized, model_config=FLAGS.config.model)
+    pts_shape = (FLAGS.config.num_rand, FLAGS.config.num_samples, 3)
+    views_shape = (FLAGS.config.num_rand, 3)
+    model_coarse, params_coarse = initialized_(rng_coarse, pts_shape, views_shape)
+
     optimizer = optim.Adam()
-    state = TrainState(
-        step=0, optimizer_coarse=optimizer.create(params_coarse), optimizer_fine=None
-    )
+    state = TrainState(step=0, optimizer=optimizer.create({"coarse": params_coarse}))
     model_fn = (model_coarse.apply, None)
 
     if FLAGS.config.num_importance > 0:
-        input_pts_shape = (
+        pts_shape = (
             FLAGS.config.num_rand,
             FLAGS.config.num_importance + FLAGS.config.num_samples,
             3,
         )
-        model_fine, params_fine = initialized(
-            init_rng_fine, input_pts_shape, input_views_shape, FLAGS.config.model_fine
-        )
-        state = state.replace(optimizer_fine=optimizer.create(params_fine))
+        model_fine, params_fine = initialized_(rng_fine, pts_shape, views_shape)
+        params_dict = {"coarse": params_coarse, "fine": params_fine}
+        state = TrainState(step=0, optimizer=optimizer.create(params_dict))
         model_fn = (model_coarse.apply, model_fine.apply)
 
     state = checkpoints.restore_checkpoint(FLAGS.model_dir, state)
@@ -198,6 +193,7 @@ def main(_):
         # donate_argnums=(0, 1))
     )
 
+    # TODO: add hparams
     writer = metric_writers.create_default_writer(
         FLAGS.model_dir, just_logging=jax.host_id() > 0
     )
@@ -269,7 +265,7 @@ def main(_):
                     }
                     if FLAGS.config.num_importance > 0:
                         summary["val/rgb_c"] = to_rgb(preds_c["rgb"])
-                        summary["val/disp_c"] = disp_post(preds["disp_c"], FLAGS.config)
+                        summary["val/disp_c"] = disp_post(preds_c["disp"], FLAGS.config)
                         summary["val/z_std"] = z_std
                     writer.write_images(step, summary)
 

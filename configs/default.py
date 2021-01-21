@@ -18,7 +18,7 @@ def get_config():
 
     config.emb = ml_collections.ConfigDict()
     config.emb.use_embed = True          # whether to use default positional encoding
-    config.emb.periodic_fns = [jnp.sin, jnp.cos]  # periodic functions to use for embedding
+    config.emb.periodic_fns = (jnp.sin, jnp.cos)  # periodic functions to use for embedding
     config.emb.multires = 10             # log2 of max freq for positional encoding (3D location)
     config.emb.multires_views = 4        # log2 of max freq for positional encoding (2D direction)
     config.emb.log_sampling = True
@@ -27,12 +27,12 @@ def get_config():
     config.model = ml_collections.ConfigDict()
     config.model.net_depth = 8           # layers in network
     config.model.net_width = 256         # channels per layer
-    config.model.skips = [4]
+    config.model.skips = (4,)
 
     config.model_fine = ml_collections.ConfigDict()
     config.model_fine.net_depth = 8      # layers in fine network
     config.model_fine.net_width = 256    # channels per layer in fine network
-    config.model_fine.skips = [4]
+    config.model_fine.skips = (4,)
 
     # pre-crop options
     config.precrop_iters = 0             # number of steps to train on central crops

@@ -88,7 +88,6 @@ def train_step(
     rng0, rng1, rng2, rng3, rng4 = random.split(rng, 5)
     inputs, targets = batch["rays"], batch["image"]
     model_coarse, model_fine = model_fn
-    opt_coarse, opt_fine = state.optimizer_coarse, state.optimizer_fine
 
     if not config.batching:
         select_idx = random.choice(
@@ -117,10 +116,10 @@ def train_step(
         white_bkgd=config.white_bkgd,
     )
 
-    def loss_fn(params_coarse, params_fine=None):
+    def loss_fn(params):
         """Loss function used for training."""
         pts, z_vals = render_rays(*rays, config, near, far, rng1)
-        raw_c = model_coarse({"params": params_coarse}, pts, viewdirs).reshape(
+        raw_c = model_coarse({"params": params["coarse"]}, pts, viewdirs).reshape(
             [config.num_rand, config.num_samples, 4]
         )
         coarse_res, weights = raw2outputs_(raw_c, z_vals, rays_d, rng=rng2)
@@ -129,7 +128,7 @@ def train_step(
         loss_f = 0
         if config.num_importance > 0:
             pts, z_vals, _ = render_rays_fine_(*rays, z_vals, weights, rng=rng3)
-            raw_f = model_fine({"params": params_fine}, pts, viewdirs).reshape(
+            raw_f = model_fine({"params": params["fine"]}, pts, viewdirs).reshape(
                 [config.num_rand, config.num_samples + config.num_importance, 4]
             )
             fine_res, _ = raw2outputs_(raw_f, z_vals, rays_d, rng=rng4)
@@ -139,24 +138,14 @@ def train_step(
         return loss, (loss_c, loss_f)
 
     lr = lr_fn(state.step)
-    if config.num_importance > 0:
-        aux, (grad_coarse, grad_fine) = jax.value_and_grad(
-            loss_fn, argnums=[0, 1], has_aux=True
-        )(opt_coarse.target, opt_fine.target)
+    aux, grad = jax.value_and_grad(loss_fn, has_aux=True)(state.optimizer.target)
 
-        grad_fine = lax.pmean(grad_fine, axis_name="batch")
-        new_opt_fine = opt_fine.apply_gradient(grad_fine, learning_rate=lr)
-    else:
-        aux, grad_coarse = jax.value_and_grad(loss_fn, has_aux=True)(opt_coarse.target)
-        new_opt_fine = None
-
-    grad_coarse = lax.pmean(grad_coarse, axis_name="batch")
-    new_opt_coarse = opt_coarse.apply_gradient(grad_coarse, learning_rate=lr)
+    grad = lax.pmean(grad, axis_name="batch")
+    new_optimizer = state.optimizer.apply_gradient(grad, learning_rate=lr)
 
     new_state = state.replace(
         step=state.step + 1,
-        optimizer_coarse=new_opt_coarse,
-        optimizer_fine=new_opt_fine,
+        optimizer=new_optimizer,
     )
     loss, (loss_c, loss_f) = aux
     metrics = {
@@ -174,7 +163,6 @@ def train_step(
 
 def eval_step(model_fn, config, near, far, state, rays):
     apply_coarse, apply_fine = model_fn
-    opt_coarse, opt_fine = state.optimizer_coarse, state.optimizer_fine
     render_rays_fine_ = functools.partial(
         render_rays_fine,
         num_importance=config.num_importance,
@@ -188,13 +176,13 @@ def eval_step(model_fn, config, near, far, state, rays):
     rays_o, rays_d, viewdirs = jnp.split(rays, [3, 6], axis=-1)
 
     pts, z_vals = render_rays(rays_o, rays_d, config, near, far)
-    raw_c = apply_coarse({"params": opt_coarse.target}, pts, viewdirs)
+    raw_c = apply_coarse({"params": state.optimizer.target["coarse"]}, pts, viewdirs)
     raw_c = jnp.reshape(raw_c, [-1, config.num_samples, 4])
     coarse_res, weights = raw2outputs_(raw_c, z_vals, rays_d)
 
     if config.num_importance > 0:
         pts, z_vals, z_std = render_rays_fine_(rays_o, rays_d, z_vals, weights)
-        raw_f = apply_fine({"params": opt_fine.target}, pts, viewdirs)
+        raw_f = apply_fine({"params": state.optimizer.target["fine"]}, pts, viewdirs)
         raw_f = jnp.reshape(raw_f, [-1, config.num_samples + config.num_importance, 4])
         fine_res, _ = raw2outputs_(raw_f, z_vals, rays_d)
         return fine_res, coarse_res, z_std

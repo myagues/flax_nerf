@@ -88,17 +88,17 @@ def save_test_imgs(data, hwf, step, idx, ch=3):
     imageio.imwrite(os.path.join(save_path, f"{idx:02d}.png"), data)
 
 
-def initialized(key, input_pts_shape, input_viewdirs_shape, model_config):
+def initialized(key, pts_shape, viewdirs_shape, model_config):
     model = NeRF(
         **model_config,
         **FLAGS.config.emb,
         use_viewdirs=FLAGS.config.use_viewdirs,
         dtype=FLAGS.config.dtype,
     )
-    initial_params = model.init(
+    initial_params = jax.jit(model.init)(
         {"params": key},
-        jnp.ones(input_pts_shape, model.dtype),
-        jnp.ones(input_viewdirs_shape, model.dtype),
+        jnp.ones(pts_shape, model.dtype),
+        jnp.ones(viewdirs_shape, model.dtype),
     )
     return model, initial_params["params"]
 
@@ -106,8 +106,7 @@ def initialized(key, input_pts_shape, input_viewdirs_shape, model_config):
 @struct.dataclass
 class TrainState:
     step: int
-    optimizer_coarse: optim.Optimizer
-    optimizer_fine: Optional[optim.Optimizer]
+    optimizer: optim.Optimizer
 
 
 def main(_):
@@ -116,7 +115,7 @@ def main(_):
     logging.info("JAX local devices: %r", jax.local_devices())
 
     rng = jax.random.PRNGKey(FLAGS.seed)
-    rng, init_rng_coarse, init_rng_fine = jax.random.split(rng, 3)
+    rng, rng_coarse, rng_fine = jax.random.split(rng, 3)
 
     ### Load dataset and data values
     datasets, counts, optics, render_datasets = get_dataset(
@@ -133,38 +132,37 @@ def main(_):
     logging.info("Render: height %d, width %d, focal %.5f", *r_hwf)
 
     ### Init model parameters and optimizer
-    input_pts_shape = (FLAGS.config.num_rand, FLAGS.config.num_samples, 3)
-    input_views_shape = (FLAGS.config.num_rand, 3)
-    model_coarse, params_coarse = initialized(
-        init_rng_coarse, input_pts_shape, input_views_shape, FLAGS.config.model
-    )
+    initialized_ = functools.partial(initialized, model_config=FLAGS.config.model)
+    pts_shape = (FLAGS.config.num_rand, FLAGS.config.num_samples, 3)
+    views_shape = (FLAGS.config.num_rand, 3)
+    model_coarse, params_coarse = initialized_(rng_coarse, pts_shape, views_shape)
+
     optimizer = optim.Adam()
-    state = TrainState(
-        step=0, optimizer_coarse=optimizer.create(params_coarse), optimizer_fine=None
-    )
+    state = TrainState(step=0, optimizer=optimizer.create({"coarse": params_coarse}))
     model_fn = (model_coarse.apply, None)
 
     if FLAGS.config.num_importance > 0:
-        input_pts_shape = (
+        pts_shape = (
             FLAGS.config.num_rand,
             FLAGS.config.num_importance + FLAGS.config.num_samples,
             3,
         )
-        model_fine, params_fine = initialized(
-            init_rng_fine, input_pts_shape, input_views_shape, FLAGS.config.model_fine
-        )
-        state = state.replace(optimizer_fine=optimizer.create(params_fine))
+        model_fine, params_fine = initialized_(rng_fine, pts_shape, views_shape)
+        params_dict = {"coarse": params_coarse, "fine": params_fine}
+        state = TrainState(step=0, optimizer=optimizer.create(params_dict))
         model_fn = (model_coarse.apply, model_fine.apply)
 
     state = checkpoints.restore_checkpoint(FLAGS.model_dir, state)
     step = int(state.step)
     state = jax_utils.replicate(state)
 
+    # TODO: TPU Colab breaks without message if this is a list
+    # a list is preferred bc tqdm can show an ETA
     render_dict = {
-        "train": list(zip(range(train_items), train_ds)),
-        "val": list(zip(range(val_items), val_ds)),
-        "test": list(zip(range(test_items), test_ds)),
-        "render": list(zip(range(num_poses), render_ds)),
+        "train": zip(range(train_items), train_ds),
+        "val": zip(range(val_items), val_ds),
+        "test": zip(range(test_items), test_ds),
+        "poses": zip(range(num_poses), render_ds),
     }
     render_poses = render_dict[FLAGS.render_video_set]
 
