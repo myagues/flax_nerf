@@ -62,7 +62,9 @@ __NOTE__: check and understand the effect of default parameters in `configs/defa
 
 ## Examples
 
-All examples were run on an NVIDIA RTX 2080Ti. Examples prior to deterministic datasets are available in [e81d608](https://github.com/myagues/flax_nerf/tree/e81d608128d92c8d15fd17c21834a5e47c185359).
+All examples were run on an NVIDIA RTX 2080Ti with commit [a32789b](https://github.com/myagues/flax_nerf/tree/d626a600b6b5731d1882d12c2d65e782ea440735).
+
+Examples prior to deterministic datasets are available in [e81d608](https://github.com/myagues/flax_nerf/tree/e81d608128d92c8d15fd17c21834a5e47c185359).
 
 ### Blender - `lego`
 

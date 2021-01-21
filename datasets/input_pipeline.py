@@ -10,7 +10,7 @@ from clu import deterministic_data
 from datasets import load_blender, load_deepvoxels, load_llff
 
 
-AUTOTUNE = tf.data.experimental.AUTOTUNE
+AUTOTUNE = tf.data.AUTOTUNE
 
 
 def prepare_train_data(dataset):
@@ -138,18 +138,18 @@ def get_dataset(data_dir, config, rng=None, cache=True, **kwargs):
     ds_output = ds_dict[config.dataset_type](data_dir, config, **kwargs)
     datasets, counts, optics, render_poses_ds, static_pose, num_poses = ds_output
 
-    if rng is not None:
-        rng_0, rng_1, rng_2 = list(jax.random.split(rng, 3))
+    if rng is None:
+        rngs = 2 * [[None, None]]
     else:
-        rng_0, rng_1, rng_2 = 3 * [[None, None]]
+        rngs = list(jax.random.split(rng))
 
     datasets_list, counts_list = [], []
     rays_fn = functools.partial(prepare_rays, config=config)
-    for idx, (ds, count) in enumerate(zip(datasets, counts)):
+    for ds, count, split in zip(datasets, counts, ["train", "val", "test"]):
         ds.options().experimental_optimization.map_parallelization = True
         ds.options().experimental_threading.private_threadpool_size = 48
         ds.options().experimental_threading.max_intra_op_parallelism = 1
-        if idx == 0:  # train
+        if split == "train":
             ds = ds.map(rays_fn, num_parallel_calls=AUTOTUNE)  # load rays
 
             if config.batching:
@@ -164,22 +164,22 @@ def get_dataset(data_dir, config, rng=None, cache=True, **kwargs):
                 ds = ds.map(map_reshape, num_parallel_calls=AUTOTUNE)
                 ds = ds.cache().repeat()
                 map_fn = functools.partial(batching_sample, config=config)
-                if rng is not None:
-                    ds = deterministic_data._preprocess_with_per_example_rng(
-                        ds, map_fn, rng=rng_0
-                    )
-                else:
+                if rng is None:
                     ds = ds.map(map_fn, num_parallel_calls=AUTOTUNE)
+                else:
+                    ds = deterministic_data._preprocess_with_per_example_rng(
+                        ds, map_fn, rng=rngs.pop()
+                    )
             else:
                 if cache:
                     ds = ds.cache()
-                ds = ds.repeat().shuffle(count, seed=rng_1[0])
+                ds = ds.repeat().shuffle(count, seed=rngs.pop()[0])
             ds = ds.batch(jax.local_device_count()).prefetch(AUTOTUNE)
             ds = prepare_train_data(ds)
         else:  # val or test
             ds = ds.repeat()
-            if idx == 1:
-                ds = ds.shuffle(count, seed=rng_2[0])
+            if split == "val":
+                ds = ds.shuffle(count, seed=rngs.pop()[0])
             ds = ds.map(rays_fn, num_parallel_calls=AUTOTUNE).prefetch(AUTOTUNE)
             ds = iter(ds)
         datasets_list.append(ds)
