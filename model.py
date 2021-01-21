@@ -1,5 +1,7 @@
 import functools
 
+import numpy as np
+
 from flax import linen as nn
 from jax import numpy as jnp, lax, vmap
 from typing import Any, Callable, Sequence
@@ -28,9 +30,9 @@ class NeRF(nn.Module):
         num_freqs = multires
 
         if self.log_sampling:
-            freq_bands = 2.0 ** jnp.linspace(0.0, max_freq_log2, num_freqs)
+            freq_bands = 2.0 ** np.linspace(0.0, max_freq_log2, num_freqs)
         else:
-            freq_bands = jnp.linspace(2.0 ** 0.0, 2.0 ** max_freq_log2, num_freqs)
+            freq_bands = np.linspace(2.0 ** 0.0, 2.0 ** max_freq_log2, num_freqs)
 
         inputs_freq = vmap(lambda x: inputs * x)(freq_bands)
         fns = jnp.stack([fn(inputs_freq) for fn in self.periodic_fns])

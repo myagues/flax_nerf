@@ -1,6 +1,7 @@
 import functools
 
 import jax
+import numpy as np
 
 from flax import linen as nn
 from jax import numpy as jnp, lax, random
@@ -17,7 +18,7 @@ def render_rays(rays_o, rays_d, config, near, far, rng=None):
         z_vals: (num_rays, num_samples) depths of the sampled positions
     """
     # decide where to sample along each ray, all rays will be sampled at the same times
-    t_vals = jnp.linspace(0.0, 1.0, config.num_samples)
+    t_vals = np.linspace(0.0, 1.0, config.num_samples)
     if config.llff.lindisp and config.dataset_type == "llff":
         # sample linearly in inverse depth (disparity)
         z_vals = 1.0 / (1.0 / near * (1.0 - t_vals) + 1.0 / far * t_vals)
@@ -94,7 +95,7 @@ def sample_pdf(bins, weights, num_importance, perturbation, rng):
     if perturbation:
         uni_samples = random.uniform(rng, shape=samples_shape)
     else:
-        uni_samples = jnp.linspace(0.0, 1.0, num_importance)
+        uni_samples = np.linspace(0.0, 1.0, num_importance)
         uni_samples = jnp.broadcast_to(uni_samples, samples_shape)
 
     # invert CDF
@@ -137,7 +138,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, rng=None):
 
     # the 'distance' from the last integration time is infinity
     dists = jnp.concatenate(
-        [dists, jnp.broadcast_to([1e10], dists[..., :1].shape)], axis=-1
+        [dists, np.broadcast_to([1e10], dists[..., :1].shape)], axis=-1
     )
     dists = dists.astype(z_vals.dtype)  # [num_rays, num_samples]
 
