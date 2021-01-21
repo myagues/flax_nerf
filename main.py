@@ -160,9 +160,10 @@ def main(_):
     state = checkpoints.restore_checkpoint(FLAGS.model_dir, state)
     start_step = int(state.step)
     # cycle already seen examples if resuming from checkpoint
-    # (only useful for deterministic data)
+    # (only useful for ensuring deterministic dataset, slow for large start_step)
     if start_step != 0:
-        _ = [next(train_ds) for _ in range(start_step)]
+        for _ in range(start_step):
+            _ = next(train_ds)
     # parameter_overview.log_parameter_overview(state.optimizer_coarse.target)
     # if FLAGS.config.num_importance > 0:
     #     parameter_overview.log_parameter_overview(state.optimizer_fine.target)
