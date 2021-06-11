@@ -143,12 +143,15 @@ def get_dataset(data_dir, config, rng=None, cache=True, **kwargs):
     else:
         rngs = list(jax.random.split(rng))
 
+    options = tf.data.Options()
+    options.experimental_optimization.map_parallelization = True
+    options.experimental_threading.private_threadpool_size = 48
+    options.experimental_threading.max_intra_op_parallelism = 1
+
     datasets_list, counts_list = [], []
     rays_fn = functools.partial(prepare_rays, config=config)
     for ds, count, split in zip(datasets, counts, ["train", "val", "test"]):
-        ds.options().experimental_optimization.map_parallelization = True
-        ds.options().experimental_threading.private_threadpool_size = 48
-        ds.options().experimental_threading.max_intra_op_parallelism = 1
+        ds.with_options(options)
         if split == "train":
             ds = ds.map(rays_fn, num_parallel_calls=AUTOTUNE)  # load rays
 
