@@ -1,7 +1,6 @@
 import functools
 
 import jax
-
 import tensorflow as tf
 
 from flax import jax_utils

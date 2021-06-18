@@ -1,85 +1,71 @@
 import functools
+import os
 
+import imageio
 import jax
+import numpy as np
 
 from absl import logging
+from flax.training import checkpoints
 from jax import numpy as jnp, lax, random
 
 from rays_utils import raw2outputs, render_rays, render_rays_fine
 
 psnr_fn = lambda x: -10.0 * jnp.log(x) / jnp.log(10.0)
+to_rgb = lambda x: (255 * np.clip(np.asarray(x), 0, 1)).astype(np.uint8)
+to_np = (
+    lambda x, y, z: np.asarray(x)
+    .reshape(1, y[0] + z, y[1], -1)
+    .astype(np.float32)[:, z:]
+)
 
 
-def create_learning_rate_scheduler(
-    factors="constant * linear_warmup * rsqrt_decay",
-    base_learning_rate=0.5,
-    warmup_steps=8000,
-    decay_factor=0.5,
-    steps_per_decay=20000,
-    steps_per_cycle=100000,
-    staircase=False,
-):
-    """Creates learning rate schedule.
-    Interprets factors in the factors string which can consist of:
-    * constant: interpreted as the constant value,
-    * linear_warmup: interpreted as linear warmup until warmup_steps,
-    * rsqrt_decay: divide by square root of max(step, warmup_steps)
-    * rsqrt_normalized_decay: divide by square root of max(step/warmup_steps, 1)
-    * decay_every: Every k steps decay the learning rate by decay_factor.
-    * cosine_decay: Cyclic cosine decay, uses steps_per_cycle parameter.
-    Args:
-        factors: string, factors separated by '*' that defines the schedule.
-        base_learning_rate: float, the starting constant for the lr schedule.
-        warmup_steps: int, how many steps to warm up for in the warmup schedule.
-        decay_factor: float, the amount to decay the learning rate by.
-        steps_per_decay: int, how often to decay the learning rate.
-        steps_per_cycle: int, steps per cycle when using cosine decay.
-    Returns:
-        a function learning_rate(step): the step-dependent lr.
-    """
-    factors = [n.strip() for n in factors.split("*")]
+def save_checkpoint(state, workdir, keep=3):
+    if jax.process_index() == 0:
+        # get train state from the first replica
+        state = jax.device_get(jax.tree_map(lambda x: x[0], state))
+        step = int(state.step)
+        checkpoints.save_checkpoint(workdir, state, step, keep=keep)
 
-    def step_fn(step):
-        """Step to learning rate function."""
-        ret = 1.0
-        for name in factors:
-            if name == "constant":
-                ret *= base_learning_rate
-            elif name == "linear_warmup":
-                ret *= jnp.minimum(1.0, step / warmup_steps)
-            elif name == "rsqrt_decay":
-                ret /= jnp.sqrt(jnp.maximum(step, warmup_steps))
-            elif name == "rsqrt_normalized_decay":
-                ret *= jnp.sqrt(warmup_steps)
-                ret /= jnp.sqrt(jnp.maximum(step, warmup_steps))
-            elif name == "decay_every":
-                if staircase:
-                    decay = step // steps_per_decay
-                else:
-                    decay = step / steps_per_decay
-                ret *= decay_factor ** decay
-            elif name == "cosine_decay":
-                progress = jnp.maximum(
-                    0.0, (step - warmup_steps) / float(steps_per_cycle)
-                )
-                ret *= jnp.maximum(
-                    0.0, 0.5 * (1.0 + jnp.cos(jnp.pi * (progress % 1.0)))
-                )
-            else:
-                raise ValueError(f"Unknown factor {name}.")
-        return jnp.asarray(ret, dtype=jnp.float32)
 
-    return step_fn
+def disp_post(disp, config):
+    if config.dataset_type == "llff":
+        disp = (disp - disp.min()) / np.clip(disp.max() - disp.min(), 1e-5, None)
+    return disp
+
+
+def prepare_render_data(rays):
+    padding = 0
+    img_h, img_w, chn = rays.shape
+    rays_remaining = np.prod(img_h) % jax.local_device_count()
+    if rays_remaining != 0:
+        padding = jax.local_device_count() - rays_remaining
+        rays = np.pad(rays, ((padding, 0), (0, 0), (0, 0)), mode="edge")
+    return rays.reshape(jax.local_device_count(), -1, img_w, chn), padding
+
+
+def gen_video(save_dir, data, filename, hwf, step, ch=3):
+    img_h, img_w, _ = hwf
+    data = to_rgb(data.reshape([-1, img_h, img_w, ch]))
+    imageio.mimwrite(os.path.join(save_dir, f"{filename}_{step:06d}.mp4"), data, fps=30)
+    # imageio.mimwrite(os.path.join(out_path, f"{filename}_{step:06d}.gif"), data, fps=30)
+
+
+def save_test_imgs(save_dir, data, hwf, step, idx, ch=3):
+    img_h, img_w, _ = hwf
+    data = to_rgb(data.reshape([img_h, img_w, ch]))
+    save_path = os.path.join(save_dir, f"testset_{step:06d}")
+    os.makedirs(save_path, exist_ok=True)
+    imageio.imwrite(os.path.join(save_path, f"{idx:02d}.png"), data)
 
 
 def train_step(
-    model_fn,
     near,
     far,
     config,
     lr_fn,
-    state,
     batch,
+    state,
     coords=None,
     rng=None,
 ):
@@ -87,7 +73,8 @@ def train_step(
     rng = jax.random.fold_in(rng, state.step)
     rng0, rng1, rng2, rng3, rng4 = random.split(rng, 5)
     inputs, targets = batch["rays"], batch["image"]
-    model_coarse, model_fine = model_fn
+    model_coarse, model_fine = state.apply_fn
+    step = state.step
 
     if not config.batching:
         select_idx = random.choice(
@@ -137,23 +124,17 @@ def train_step(
         loss = loss_c + loss_f
         return loss, (loss_c, loss_f)
 
-    lr = lr_fn(state.step)
-    aux, grad = jax.value_and_grad(loss_fn, has_aux=True)(state.optimizer.target)
+    aux, grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    grads = lax.pmean(grads, axis_name="batch")
+    new_state = state.apply_gradients(grads=grads)
 
-    grad = lax.pmean(grad, axis_name="batch")
-    new_optimizer = state.optimizer.apply_gradient(grad, learning_rate=lr)
-
-    new_state = state.replace(
-        step=state.step + 1,
-        optimizer=new_optimizer,
-    )
     loss, (loss_c, loss_f) = aux
     metrics = {
         "loss": loss,
         "loss_c": loss_c,
         "psnr": psnr_fn(loss_f) if config.num_importance > 0 else psnr_fn(loss_c),
         "psnr_c": psnr_fn(loss_c),
-        "lr": lr,
+        "lr": lr_fn(step),
     }
     if config.num_importance > 0:
         metrics.update({"loss_f": loss_f, "psnr_f": psnr_fn(loss_f)})
@@ -161,8 +142,8 @@ def train_step(
     return new_state, metrics
 
 
-def eval_step(model_fn, config, near, far, state, rays):
-    apply_coarse, apply_fine = model_fn
+def eval_step(config, near, far, state, rays):
+    apply_coarse, apply_fine = state.apply_fn
     render_rays_fine_ = functools.partial(
         render_rays_fine,
         num_importance=config.num_importance,
@@ -176,13 +157,13 @@ def eval_step(model_fn, config, near, far, state, rays):
     rays_o, rays_d, viewdirs = jnp.split(rays, [3, 6], axis=-1)
 
     pts, z_vals = render_rays(rays_o, rays_d, config, near, far)
-    raw_c = apply_coarse({"params": state.optimizer.target["coarse"]}, pts, viewdirs)
+    raw_c = apply_coarse({"params": state.params["coarse"]}, pts, viewdirs)
     raw_c = jnp.reshape(raw_c, [-1, config.num_samples, 4])
     coarse_res, weights = raw2outputs_(raw_c, z_vals, rays_d)
 
     if config.num_importance > 0:
         pts, z_vals, z_std = render_rays_fine_(rays_o, rays_d, z_vals, weights)
-        raw_f = apply_fine({"params": state.optimizer.target["fine"]}, pts, viewdirs)
+        raw_f = apply_fine({"params": state.params["fine"]}, pts, viewdirs)
         raw_f = jnp.reshape(raw_f, [-1, config.num_samples + config.num_importance, 4])
         fine_res, _ = raw2outputs_(raw_f, z_vals, rays_d)
         return fine_res, coarse_res, z_std

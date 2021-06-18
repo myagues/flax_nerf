@@ -19,7 +19,7 @@ Most of the comments are from the original work, which are very helpful for unde
 Install `jax` and `jaxlib` according to your [platform configuration](https://github.com/google/jax#installation). Then, install the necessary dependencies with:
 
 ```
-pip install clu flax imageio imageio-ffmpeg ml_collections pandas tensorboard 'tensorflow>=2.4' tqdm
+pip install --upgrade clu flax imageio imageio-ffmpeg ml_collections optax pandas tensorboard 'tensorflow>=2.4' tqdm
 ```
 
 ## Data
@@ -36,13 +36,13 @@ In addition, there is:
 ## How to run
 
 Required parameters to run the training are:
-- `--data_dir`: directory where data is place
+- `--data_dir`: directory where data is placed
 - `--model_dir`: model saving location
 - `--config`: configuration parameters
 
 ```
 python main.py \
-    --data_dir=/data/nerf_synthetic/lego \
+    --data_dir=/data/nerf_synthetic \
     --model_dir=logs \
     --config=configs/test_blender_lego.py
 ```
@@ -51,7 +51,7 @@ Configuration flag is defined using [`config_flags`](https://github.com/google/m
 
 ```
 python main.py \
-    --data_dir=/data/nerf_synthetic/lego \
+    --data_dir=/data/nerf_synthetic \
     --model_dir=logs \
     --config=configs/test_blender_lego.py \
     --config.num_samples=128 \

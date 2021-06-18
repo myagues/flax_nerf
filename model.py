@@ -1,10 +1,10 @@
 import functools
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
 from flax import linen as nn
 from jax import numpy as jnp, lax, vmap
-from typing import Any, Callable, Sequence
 
 
 class NeRF(nn.Module):
